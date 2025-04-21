@@ -1097,7 +1097,7 @@ class SmartImageRegion:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "type": (["Rectangle"],), # Only Rectangle for now, more to be added later
+                "type": (["Rectangle", "Polygon"],), # Added Polygon type
                 # Hidden input to store region data as JSON string
                 "region_data": ("STRING", {"default": '{"x1":0.25,"y1":0.25,"x2":0.75,"y2":0.75}', "multiline": False, "hidden": True}),
             },
@@ -1133,56 +1133,100 @@ class SmartImageRegion:
         # 2. Parse region_data JSON
         try:
             region = json.loads(region_data)
-            if not isinstance(region, dict):
+            if type == "Rectangle" and not isinstance(region, dict):
                 region = {"x1": 0.25, "y1": 0.25, "x2": 0.75, "y2": 0.75}
+            elif type == "Polygon" and not isinstance(region, list):
+                # Default triangle if invalid polygon data
+                region = [{"x": 0.25, "y": 0.25}, {"x": 0.75, "y": 0.25}, {"x": 0.5, "y": 0.75}]
         except Exception as e:
             print(f"Error parsing region_data: {e}")
-            region = {"x1": 0.25, "y1": 0.25, "x2": 0.75, "y2": 0.75}
+            if type == "Rectangle":
+                region = {"x1": 0.25, "y1": 0.25, "x2": 0.75, "y2": 0.75}
+            else:  # Polygon
+                region = [{"x": 0.25, "y": 0.25}, {"x": 0.75, "y": 0.25}, {"x": 0.5, "y": 0.75}]
 
         # 3. Generate mask image
         # Create a binary mask where the region is 1.0 and everywhere else is 0.0
         # Standard MASK format is [batch, height, width] (no channels dimension)
         mask_np = np.zeros((h, w), dtype=np.float32)
 
-        # Get pixel coordinates (convert from 0-1 to pixel coords)
-        # Note: ComfyUI and our JS use top-left as origin with y increasing downward
-        # so we need to flip the y-coordinates for the mask
-        x1 = max(0, min(w-1, int(region.get("x1", 0.25) * w)))
-        y1 = max(0, min(h-1, int(region.get("y1", 0.25) * h)))  # No y-flip for consistency with bbox
-        x2 = max(0, min(w-1, int(region.get("x2", 0.75) * w)))
-        y2 = max(0, min(h-1, int(region.get("y2", 0.75) * h)))  # No y-flip for consistency with bbox
+        if type == "Rectangle":
+            # Get pixel coordinates (convert from 0-1 to pixel coords)
+            # Note: ComfyUI and our JS use top-left as origin with y increasing downward
+            # so we need to flip the y-coordinates for the mask
+            x1 = max(0, min(w-1, int(region.get("x1", 0.25) * w)))
+            y1 = max(0, min(h-1, int(region.get("y1", 0.25) * h)))  # No y-flip for consistency with bbox
+            x2 = max(0, min(w-1, int(region.get("x2", 0.75) * w)))
+            y2 = max(0, min(h-1, int(region.get("y2", 0.75) * h)))  # No y-flip for consistency with bbox
 
-        # Ensure x1 <= x2 and y1 <= y2
-        x1, x2 = min(x1, x2), max(x1, x2)
-        y1, y2 = min(y1, y2), max(y1, y2)
+            # Ensure x1 <= x2 and y1 <= y2
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
 
-        # Fill the region in the mask
-        mask_np[y1:y2+1, x1:x2+1] = 1.0
+            # Fill the region in the mask
+            mask_np[y1:y2+1, x1:x2+1] = 1.0
+
+            # 4. Create bbox output (normalized coordinates)
+            # Use original normalized coordinates from region data for consistency
+            x1_norm = region.get("x1", 0.25)
+            y1_norm = region.get("y1", 0.25)
+            x2_norm = region.get("x2", 0.75)
+            y2_norm = region.get("y2", 0.75)
+
+            # Ensure normalized coordinates are in correct order and range
+            x1_norm, x2_norm = min(x1_norm, x2_norm), max(x1_norm, x2_norm)
+            y1_norm, y2_norm = min(y1_norm, y2_norm), max(y1_norm, y2_norm)
+            x1_norm = max(0.0, min(1.0, x1_norm))
+            y1_norm = max(0.0, min(1.0, y1_norm))
+            x2_norm = max(0.0, min(1.0, x2_norm))
+            y2_norm = max(0.0, min(1.0, y2_norm))
+
+            # Calculate width and height
+            width_norm = x2_norm - x1_norm
+            height_norm = y2_norm - y1_norm
+
+            # BBOX format: [x, y, width, height] (normalized 0-1)
+            bbox = [x1_norm, y1_norm, width_norm, height_norm]
+
+        else:  # Polygon type
+            # Convert normalized polygon points to pixel coordinates
+            if not region or len(region) < 3:  # Ensure we have at least 3 points for a valid polygon
+                # Default triangle if invalid polygon data
+                region = [{"x": 0.25, "y": 0.25}, {"x": 0.75, "y": 0.25}, {"x": 0.5, "y": 0.75}]
+                
+            poly_points = []
+            for point in region:
+                x = max(0, min(w-1, int(point.get("x", 0.5) * w)))
+                y = max(0, min(h-1, int(point.get("y", 0.5) * h)))
+                poly_points.append([x, y])
+                
+            # Convert to numpy array for OpenCV
+            poly_points_np = np.array(poly_points, dtype=np.int32)
+            
+            # Fill polygon in the mask using OpenCV
+            cv2.fillPoly(mask_np, [poly_points_np], 1.0)
+            
+            # Calculate bounding box of the polygon
+            min_x, min_y = 1.0, 1.0
+            max_x, max_y = 0.0, 0.0
+            
+            for point in region:
+                x_norm = max(0.0, min(1.0, point.get("x", 0.5)))
+                y_norm = max(0.0, min(1.0, point.get("y", 0.5)))
+                min_x = min(min_x, x_norm)
+                min_y = min(min_y, y_norm)
+                max_x = max(max_x, x_norm)
+                max_y = max(max_y, y_norm)
+            
+            # Calculate width and height
+            width_norm = max_x - min_x
+            height_norm = max_y - min_y
+            
+            # BBOX format: [x, y, width, height] (normalized 0-1)
+            bbox = [min_x, min_y, width_norm, height_norm]
 
         # Convert to tensor with batch dimension [batch, height, width]
         mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)
-
-        # 4. Create bbox output (normalized coordinates)
-        # Use original normalized coordinates from region data for consistency
-        x1_norm = region.get("x1", 0.25)
-        y1_norm = region.get("y1", 0.25)
-        x2_norm = region.get("x2", 0.75)
-        y2_norm = region.get("y2", 0.75)
-
-        # Ensure normalized coordinates are in correct order and range
-        x1_norm, x2_norm = min(x1_norm, x2_norm), max(x1_norm, x2_norm)
-        y1_norm, y2_norm = min(y1_norm, y2_norm), max(y1_norm, y2_norm)
-        x1_norm = max(0.0, min(1.0, x1_norm))
-        y1_norm = max(0.0, min(1.0, y1_norm))
-        x2_norm = max(0.0, min(1.0, x2_norm))
-        y2_norm = max(0.0, min(1.0, y2_norm))
-
-        # Calculate width and height
-        width_norm = x2_norm - x1_norm
-        height_norm = y2_norm - y1_norm
-
-        # BBOX format: [x, y, width, height] (normalized 0-1)
-        bbox = [x1_norm, y1_norm, width_norm, height_norm]
 
         # Return results for the workflow graph AND data for the UI
         return {"result": (mask_tensor, bbox), "ui": ui_data}

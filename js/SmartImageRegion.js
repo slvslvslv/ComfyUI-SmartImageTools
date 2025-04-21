@@ -12,6 +12,11 @@ app.registerExtension({
             function getRegionWidget(node) {
                 return node.widgets.find(w => w.name === "region_data");
             }
+            
+            // Find the type widget
+            function getTypeWidget(node) {
+                return node.widgets.find(w => w.name === "type");
+            }
 
             // Initialize region properties
             const initProperties = (ctx) => {
@@ -21,36 +26,73 @@ app.registerExtension({
                 
                 // Get the hidden widget
                 const regionWidget = getRegionWidget(ctx);
-                let region = { x1: 0.25, y1: 0.25, x2: 0.75, y2: 0.75 };
+                const typeWidget = getTypeWidget(ctx);
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
                 
-                if (regionWidget && regionWidget.value) {
-                    // Parse region from the widget value
-                    try {
-                        const parsed = JSON.parse(regionWidget.value);
-                        if (typeof parsed === 'object' && parsed !== null) {
-                            region = {
-                                x1: parsed.x1 !== undefined ? parseFloat(parsed.x1) : 0.25,
-                                y1: parsed.y1 !== undefined ? parseFloat(parsed.y1) : 0.25,
-                                x2: parsed.x2 !== undefined ? parseFloat(parsed.x2) : 0.75,
-                                y2: parsed.y2 !== undefined ? parseFloat(parsed.y2) : 0.75
-                            };
+                if (regionType === "Rectangle") {
+                    let region = { x1: 0.25, y1: 0.25, x2: 0.75, y2: 0.75 };
+                    
+                    if (regionWidget && regionWidget.value) {
+                        // Parse region from the widget value
+                        try {
+                            const parsed = JSON.parse(regionWidget.value);
+                            if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+                                region = {
+                                    x1: parsed.x1 !== undefined ? parseFloat(parsed.x1) : 0.25,
+                                    y1: parsed.y1 !== undefined ? parseFloat(parsed.y1) : 0.25,
+                                    x2: parsed.x2 !== undefined ? parseFloat(parsed.x2) : 0.75,
+                                    y2: parsed.y2 !== undefined ? parseFloat(parsed.y2) : 0.75
+                                };
+                            }
+                        } catch (e) {
+                            console.error("Error parsing region_data:", e);
                         }
-                    } catch (e) {
-                        console.error("Error parsing region_data:", e);
+                    }
+                    
+                    // Store region in properties
+                    ctx.properties.region = region;
+                } else { // Polygon
+                    // Default polygon (triangle)
+                    let points = [
+                        { x: 0.25, y: 0.25 },
+                        { x: 0.75, y: 0.25 },
+                        { x: 0.5, y: 0.75 }
+                    ];
+                    
+                    if (regionWidget && regionWidget.value) {
+                        // Parse polygon points from the widget value
+                        try {
+                            const parsed = JSON.parse(regionWidget.value);
+                            if (Array.isArray(parsed) && parsed.length >= 3) {
+                                // Validate points
+                                points = parsed.map(point => ({
+                                    x: point.x !== undefined ? Math.max(0, Math.min(1, parseFloat(point.x))) : 0.5,
+                                    y: point.y !== undefined ? Math.max(0, Math.min(1, parseFloat(point.y))) : 0.5
+                                }));
+                            }
+                        } catch (e) {
+                            console.error("Error parsing polygon points:", e);
+                        }
+                    }
+                    
+                    // Store points in properties
+                    ctx.properties.points = points;
+                }
+                
+                // Update widget with initial value based on type
+                if (regionWidget) {
+                    if (regionType === "Rectangle") {
+                        regionWidget.value = JSON.stringify(ctx.properties.region);
+                    } else { // Polygon
+                        regionWidget.value = JSON.stringify(ctx.properties.points);
                     }
                 }
                 
-                // Store region in properties
-                ctx.properties.region = region;
-                
-                // Update widget with initial value
-                if (regionWidget) {
-                    regionWidget.value = JSON.stringify(region);
-                }
-                
-                ctx.dragCorner = null; // Which corner is being dragged: null, "tl", "tr", "bl", "br"
+                ctx.dragCorner = null; // Which corner/point is being dragged: null, "tl", "tr", "bl", "br" or point index
                 ctx.isDragging = false;
                 ctx.resetButtonRect = null;
+                ctx.addButtonRect = null;
+                ctx.removeButtonRect = null;
                 
                 // Initialize SmartImage
                 ctx.smartImage = new SmartImage();
@@ -58,18 +100,25 @@ app.registerExtension({
 
             // Function to update widget when region changes
             const updateRegionWidget = (node) => {
-                if (!node.properties.region) return;
-                
                 const regionWidget = getRegionWidget(node);
-                if (regionWidget) {
-                    // Convert y coordinates to bottom-left system (ComfyUI convention)
-                    // No need to flip here as we do it in the drawing logic
-                    regionWidget.value = JSON.stringify(node.properties.region);
+                const typeWidget = getTypeWidget(node);
+                if (!regionWidget) return;
+                
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
+                
+                if (regionType === "Rectangle") {
+                    if (!node.properties.region) return;
                     
-                    // Notify ComfyUI that a parameter changed
-                    if (regionWidget.callback) {
-                        regionWidget.callback(regionWidget.value);
-                    }
+                    regionWidget.value = JSON.stringify(node.properties.region);
+                } else { // Polygon
+                    if (!node.properties.points) return;
+                    
+                    regionWidget.value = JSON.stringify(node.properties.points);
+                }
+                
+                // Notify ComfyUI that a parameter changed
+                if (regionWidget.callback) {
+                    regionWidget.callback(regionWidget.value);
                 }
             };
 
@@ -78,6 +127,22 @@ app.registerExtension({
             nodeType.prototype.onNodeCreated = function() {
                 const result = onNodeCreated?.apply(this, arguments);
                 initProperties(this);
+                
+                // Setup callback on type widget to reinitialize properties
+                const typeWidget = getTypeWidget(this);
+                if (typeWidget) {
+                    const originalCallback = typeWidget.callback;
+                    typeWidget.callback = (value) => {
+                        if (originalCallback) {
+                            originalCallback(value);
+                        }
+                        
+                        // Re-initialize properties when type changes
+                        initProperties(this);
+                        this.setDirtyCanvas(true, true);
+                    };
+                }
+                
                 return result;
             };
 
@@ -99,6 +164,10 @@ app.registerExtension({
                     this.smartImage.setDimensions(null);
                 }
                 
+                // Get the region type
+                const typeWidget = getTypeWidget(this);
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
+                
                 // Check if region_data is provided from the backend
                 if (message?.region_data) {
                     try {
@@ -111,28 +180,46 @@ app.registerExtension({
                         } else {
                             const regionFromBackend = JSON.parse(regionDataString);
                             
-                            // Verify it's a valid object with required properties
-                            if (typeof regionFromBackend === 'object' && regionFromBackend !== null) {
-                                // Validate and ensure all required properties exist
-                                const validRegion = {
-                                    x1: 'x1' in regionFromBackend ? parseFloat(regionFromBackend.x1) : 0.25,
-                                    y1: 'y1' in regionFromBackend ? parseFloat(regionFromBackend.y1) : 0.25,
-                                    x2: 'x2' in regionFromBackend ? parseFloat(regionFromBackend.x2) : 0.75,
-                                    y2: 'y2' in regionFromBackend ? parseFloat(regionFromBackend.y2) : 0.75
-                                };
-                                
-                                // Ensure all values are in valid range
-                                validRegion.x1 = Math.max(0, Math.min(1, validRegion.x1));
-                                validRegion.y1 = Math.max(0, Math.min(1, validRegion.y1));
-                                validRegion.x2 = Math.max(0, Math.min(1, validRegion.x2));
-                                validRegion.y2 = Math.max(0, Math.min(1, validRegion.y2));
-                                
-                                // Update region properties
-                                if (newImageLoaded || JSON.stringify(this.properties.region) !== JSON.stringify(validRegion)) {
-                                    this.properties.region = validRegion;
+                            if (regionType === "Rectangle") {
+                                // Rectangle mode
+                                if (typeof regionFromBackend === 'object' && regionFromBackend !== null && !Array.isArray(regionFromBackend)) {
+                                    // Validate and ensure all required properties exist
+                                    const validRegion = {
+                                        x1: 'x1' in regionFromBackend ? parseFloat(regionFromBackend.x1) : 0.25,
+                                        y1: 'y1' in regionFromBackend ? parseFloat(regionFromBackend.y1) : 0.25,
+                                        x2: 'x2' in regionFromBackend ? parseFloat(regionFromBackend.x2) : 0.75,
+                                        y2: 'y2' in regionFromBackend ? parseFloat(regionFromBackend.y2) : 0.75
+                                    };
+                                    
+                                    // Ensure all values are in valid range
+                                    validRegion.x1 = Math.max(0, Math.min(1, validRegion.x1));
+                                    validRegion.y1 = Math.max(0, Math.min(1, validRegion.y1));
+                                    validRegion.x2 = Math.max(0, Math.min(1, validRegion.x2));
+                                    validRegion.y2 = Math.max(0, Math.min(1, validRegion.y2));
+                                    
+                                    // Update region properties
+                                    if (newImageLoaded || JSON.stringify(this.properties.region) !== JSON.stringify(validRegion)) {
+                                        this.properties.region = validRegion;
+                                    }
+                                } else {
+                                    console.warn("Rectangle region_data is not a valid object:", regionFromBackend);
                                 }
-                            } else {
-                                console.warn("region_data is not a valid object:", regionFromBackend);
+                            } else { // Polygon
+                                // Polygon mode
+                                if (Array.isArray(regionFromBackend) && regionFromBackend.length >= 3) {
+                                    // Validate and normalize points
+                                    const validPoints = regionFromBackend.map(point => ({
+                                        x: 'x' in point ? Math.max(0, Math.min(1, parseFloat(point.x))) : 0.5,
+                                        y: 'y' in point ? Math.max(0, Math.min(1, parseFloat(point.y))) : 0.5
+                                    }));
+                                    
+                                    // Update points
+                                    if (newImageLoaded || JSON.stringify(this.properties.points) !== JSON.stringify(validPoints)) {
+                                        this.properties.points = validPoints;
+                                    }
+                                } else {
+                                    console.warn("Polygon region_data is not a valid array:", regionFromBackend);
+                                }
                             }
                         }
                     } catch (e) {
@@ -148,7 +235,7 @@ app.registerExtension({
                 onDrawForeground?.apply(this, arguments);
 
                 // Ensure properties are initialized if they were somehow lost
-                if (!this.properties || !this.properties.region || !this.smartImage) {
+                if (!this.properties || (!this.properties.region && !this.properties.points) || !this.smartImage) {
                     initProperties(this);
                 }
 
@@ -156,6 +243,7 @@ app.registerExtension({
                 const titleHeight = LiteGraph.NODE_TITLE_HEIGHT || 20;
                 const bottomBarHeight = 16; // Height for buttons and text
                 const buttonWidth = 60; // Larger button
+                const smallButtonWidth = 40; // Smaller button for Add/Remove
                 const textFontSize = 10;
                 const nodeWidth = this.size[0];
 				const nodeHeight = this.size[1];
@@ -166,156 +254,384 @@ app.registerExtension({
 				const canvasScale = 1;  //app.canvas?.ds?.scale || 1;
                 const handleSize = baseHandleSize / canvasScale;
                 
+                // Get the region type
+                const typeWidget = getTypeWidget(this);
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
+                
                 // Draw the image using SmartImage
                 const imageRect = this.smartImage.drawImage(ctx, 0, imageTopMargin, nodeWidth, nodeHeight - bottomBarHeight - imageTopMargin);
                 
                 if (imageRect) {
-                    // Get normalized region coordinates
-                    const region = this.properties.region;
-                    
-                    // Convert normalized coordinates to canvas coordinates
-                    const x1Canvas = imageRect.x + region.x1 * imageRect.w;
-                    const y1Canvas = imageRect.y + region.y1 * imageRect.h;
-                    const x2Canvas = imageRect.x + region.x2 * imageRect.w;
-                    const y2Canvas = imageRect.y + region.y2 * imageRect.h;
-                    
-                    // Draw rectangle outline
-                    ctx.strokeStyle = "rgba(0, 255, 255, 0.8)"; // Cyan color
-                    ctx.lineWidth = 1;
-                    ctx.beginPath();
-                    ctx.rect(
-                        Math.min(x1Canvas, x2Canvas), 
-                        Math.min(y1Canvas, y2Canvas),
-                        Math.abs(x2Canvas - x1Canvas),
-                        Math.abs(y2Canvas - y1Canvas)
-                    );
-                    ctx.stroke();
-                    
-                    // Draw semi-transparent fill
-                    ctx.fillStyle = "rgba(0, 255, 255, 0.2)"; // Cyan with transparency
-                    ctx.fill();
-                    
-                    // Draw corner handles (squares)
-                    const cornerPoints = [
-                        { x: x1Canvas, y: y1Canvas, id: "tl" }, // Top-left
-                        { x: x2Canvas, y: y1Canvas, id: "tr" }, // Top-right
-                        { x: x1Canvas, y: y2Canvas, id: "bl" }, // Bottom-left
-                        { x: x2Canvas, y: y2Canvas, id: "br" }  // Bottom-right
-                    ];
-                    
-                    ctx.fillStyle = "rgba(255, 255, 255, 0.9)"; // White fill
-                    ctx.strokeStyle = "rgba(0, 0, 0, 0.9)"; // Black outline
-                    ctx.lineWidth = 0.5;
-                    
-                    for (const corner of cornerPoints) {
-                        // Draw corner handle (centered on corner point)
+                    if (regionType === "Rectangle") {
+                        // RECTANGLE MODE
+                        // Get normalized region coordinates
+                        const region = this.properties.region;
+                        
+                        // Convert normalized coordinates to canvas coordinates
+                        const x1Canvas = imageRect.x + region.x1 * imageRect.w;
+                        const y1Canvas = imageRect.y + region.y1 * imageRect.h;
+                        const x2Canvas = imageRect.x + region.x2 * imageRect.w;
+                        const y2Canvas = imageRect.y + region.y2 * imageRect.h;
+                        
+                        // Draw rectangle outline
+                        ctx.strokeStyle = "rgba(0, 255, 255, 0.8)"; // Cyan color
+                        ctx.lineWidth = 1;
                         ctx.beginPath();
                         ctx.rect(
-                            corner.x - handleSize/2, 
-                            corner.y - handleSize/2,
-                            handleSize,
-                            handleSize
+                            Math.min(x1Canvas, x2Canvas), 
+                            Math.min(y1Canvas, y2Canvas),
+                            Math.abs(x2Canvas - x1Canvas),
+                            Math.abs(y2Canvas - y1Canvas)
                         );
-                        ctx.fill();
                         ctx.stroke();
+                        
+                        // Draw semi-transparent fill
+                        ctx.fillStyle = "rgba(0, 255, 255, 0.2)"; // Cyan with transparency
+                        ctx.fill();
+                        
+                        // Draw corner handles (squares)
+                        const cornerPoints = [
+                            { x: x1Canvas, y: y1Canvas, id: "tl" }, // Top-left
+                            { x: x2Canvas, y: y1Canvas, id: "tr" }, // Top-right
+                            { x: x1Canvas, y: y2Canvas, id: "bl" }, // Bottom-left
+                            { x: x2Canvas, y: y2Canvas, id: "br" }  // Bottom-right
+                        ];
+                        
+                        ctx.fillStyle = "rgba(255, 255, 255, 0.9)"; // White fill
+                        ctx.strokeStyle = "rgba(0, 0, 0, 0.9)"; // Black outline
+                        ctx.lineWidth = 0.5;
+                        
+                        for (const corner of cornerPoints) {
+                            // Draw corner handle (centered on corner point)
+                            ctx.beginPath();
+                            ctx.rect(
+                                corner.x - handleSize/2, 
+                                corner.y - handleSize/2,
+                                handleSize,
+                                handleSize
+                            );
+                            ctx.fill();
+                            ctx.stroke();
+                        }
+                        
+                        // Bottom bar text for rectangle
+                        const regionWidth = Math.abs(this.properties.region.x2 - this.properties.region.x1);
+                        const regionHeight = Math.abs(this.properties.region.y2 - this.properties.region.y1);
+                        let displayText = `Region: ${(regionWidth*100).toFixed(0)}% × ${(regionHeight*100).toFixed(0)}%`;
+                        if (this.smartImage.dimensions) {
+                            const pixelWidth = Math.round(regionWidth * this.smartImage.dimensions[0]);
+                            const pixelHeight = Math.round(regionHeight * this.smartImage.dimensions[1]);
+                            displayText += ` (${pixelWidth}×${pixelHeight}px)`;
+                        }
+                        
+                        // Draw Bottom Bar with rectangle info and reset button
+                        const bottomY = nodeHeight - margin - bottomBarHeight;
+                        
+                        // Display region dimensions as text
+                        ctx.fillStyle = "#CCC";
+                        ctx.font = `${textFontSize}px Arial`;
+                        ctx.textAlign = "left";
+                        ctx.fillText(displayText, margin, bottomY + bottomBarHeight/2 + textFontSize/3);
+                        
+                        // "Reset" Button (right aligned)
+                        this.resetButtonRect = { 
+                            x: nodeWidth - margin - buttonWidth, 
+                            y: bottomY, 
+                            w: buttonWidth, 
+                            h: bottomBarHeight 
+                        };
+                        ctx.fillStyle = "#444"; // Button background
+                        ctx.fillRect(this.resetButtonRect.x, this.resetButtonRect.y, this.resetButtonRect.w, this.resetButtonRect.h);
+                        ctx.fillStyle = "#CCC";
+                        ctx.textAlign = "center";
+                        ctx.fillText("Reset", this.resetButtonRect.x + buttonWidth/2, bottomY + bottomBarHeight/2 + textFontSize/3);
+                        
+                        // Clear polygon-specific buttons
+                        this.addButtonRect = null;
+                        this.removeButtonRect = null;
+                        
+                    } else {
+                        // POLYGON MODE
+                        // Get normalized polygon points
+                        const points = this.properties.points;
+                        
+                        if (points.length < 3) {
+                            // Ensure we have at least 3 points
+                            this.properties.points = [
+                                { x: 0.25, y: 0.25 },
+                                { x: 0.75, y: 0.25 },
+                                { x: 0.5, y: 0.75 }
+                            ];
+                        }
+                        
+                        // Convert normalized coordinates to canvas coordinates
+                        const canvasPoints = points.map(point => ({
+                            x: imageRect.x + point.x * imageRect.w,
+                            y: imageRect.y + point.y * imageRect.h
+                        }));
+                        
+                        // Draw polygon outline
+                        ctx.strokeStyle = "rgba(0, 255, 255, 0.8)"; // Cyan color
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        
+                        if (canvasPoints.length > 0) {
+                            ctx.moveTo(canvasPoints[0].x, canvasPoints[0].y);
+                            for (let i = 1; i < canvasPoints.length; i++) {
+                                ctx.lineTo(canvasPoints[i].x, canvasPoints[i].y);
+                            }
+                            ctx.closePath();
+                        }
+                        
+                        ctx.stroke();
+                        
+                        // Draw semi-transparent fill
+                        ctx.fillStyle = "rgba(0, 255, 255, 0.2)"; // Cyan with transparency
+                        ctx.fill();
+                        
+                        // Draw vertex handles (squares)
+                        ctx.fillStyle = "rgba(255, 255, 255, 0.9)"; // White fill
+                        ctx.strokeStyle = "rgba(0, 0, 0, 0.9)"; // Black outline
+                        ctx.lineWidth = 0.5;
+                        
+                        for (let i = 0; i < canvasPoints.length; i++) {
+                            const point = canvasPoints[i];
+                            // Draw vertex handle
+                            ctx.beginPath();
+                            ctx.rect(
+                                point.x - handleSize/2, 
+                                point.y - handleSize/2,
+                                handleSize,
+                                handleSize
+                            );
+                            ctx.fill();
+                            ctx.stroke();
+                        }
+                        
+                        // Bottom bar for polygon
+                        const bottomY = nodeHeight - margin - bottomBarHeight;
+                        
+                        // Display polygon vertex count
+                        ctx.fillStyle = "#CCC";
+                        ctx.font = `${textFontSize}px Arial`;
+                        ctx.textAlign = "left";
+                        let displayText = `Polygon: ${points.length} vertices`;
+                        ctx.fillText(displayText, margin + 2*smallButtonWidth + 10, bottomY + bottomBarHeight/2 + textFontSize/3);
+                        
+                        // "Add" Button (left aligned)
+                        this.addButtonRect = { 
+                            x: margin, 
+                            y: bottomY, 
+                            w: smallButtonWidth, 
+                            h: bottomBarHeight 
+                        };
+                        ctx.fillStyle = "#2a662a"; // Green button background
+                        ctx.fillRect(this.addButtonRect.x, this.addButtonRect.y, this.addButtonRect.w, this.addButtonRect.h);
+                        ctx.fillStyle = "#CCC";
+                        ctx.textAlign = "center";
+                        ctx.fillText("Add", this.addButtonRect.x + smallButtonWidth/2, bottomY + bottomBarHeight/2 + textFontSize/3);
+                        
+                        // "Remove" Button (second from left)
+                        this.removeButtonRect = { 
+                            x: margin + smallButtonWidth + 5, 
+                            y: bottomY, 
+                            w: smallButtonWidth, 
+                            h: bottomBarHeight 
+                        };
+                        ctx.fillStyle = points.length <= 3 ? "#666" : "#662a2a"; // Red button background (gray if disabled)
+                        ctx.fillRect(this.removeButtonRect.x, this.removeButtonRect.y, this.removeButtonRect.w, this.removeButtonRect.h);
+                        ctx.fillStyle = "#CCC";
+                        ctx.textAlign = "center";
+                        ctx.fillText("Remove", this.removeButtonRect.x + smallButtonWidth/2, bottomY + bottomBarHeight/2 + textFontSize/3);
+                        
+                        // "Reset" Button (right aligned)
+                        this.resetButtonRect = { 
+                            x: nodeWidth - margin - buttonWidth, 
+                            y: bottomY, 
+                            w: buttonWidth, 
+                            h: bottomBarHeight 
+                        };
+                        ctx.fillStyle = "#444"; // Button background
+                        ctx.fillRect(this.resetButtonRect.x, this.resetButtonRect.y, this.resetButtonRect.w, this.resetButtonRect.h);
+                        ctx.fillStyle = "#CCC";
+                        ctx.textAlign = "center";
+                        ctx.fillText("Reset", this.resetButtonRect.x + buttonWidth/2, bottomY + bottomBarHeight/2 + textFontSize/3);
                     }
                 }
-
-                // Draw Bottom Bar with reset button
-                const bottomY = nodeHeight - margin - bottomBarHeight;
-                
-                // Display region dimensions as text
-                ctx.fillStyle = "#CCC";
-                ctx.font = `${textFontSize}px Arial`;
-                ctx.textAlign = "left";
-                const regionWidth = Math.abs(this.properties.region.x2 - this.properties.region.x1);
-                const regionHeight = Math.abs(this.properties.region.y2 - this.properties.region.y1);
-                let displayText = `Region: ${(regionWidth*100).toFixed(0)}% × ${(regionHeight*100).toFixed(0)}%`;
-                if (this.smartImage.dimensions) {
-                    const pixelWidth = Math.round(regionWidth * this.smartImage.dimensions[0]);
-                    const pixelHeight = Math.round(regionHeight * this.smartImage.dimensions[1]);
-                    displayText += ` (${pixelWidth}×${pixelHeight}px)`;
-                }
-                ctx.fillText(displayText, margin, bottomY + bottomBarHeight/2 + textFontSize/3);
-                
-                // "Reset" Button (right aligned)
-                this.resetButtonRect = { 
-                    x: nodeWidth - margin - buttonWidth, 
-                    y: bottomY, 
-                    w: buttonWidth, 
-                    h: bottomBarHeight 
-                };
-                ctx.fillStyle = "#444"; // Button background
-                ctx.fillRect(this.resetButtonRect.x, this.resetButtonRect.y, this.resetButtonRect.w, this.resetButtonRect.h);
-                ctx.fillStyle = "#CCC";
-                ctx.textAlign = "center";
-                ctx.fillText("Reset", this.resetButtonRect.x + buttonWidth/2, bottomY + bottomBarHeight/2 + textFontSize/3);
             };
 
             nodeType.prototype.onMouseDown = function(e, localPos, graphCanvas) {
                 if (!e.isPrimary) return false; // Only left click
 
                 const clickPos = { x: localPos[0], y: localPos[1] };
+                const typeWidget = getTypeWidget(this);
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
 
+                // Check buttons regardless of type
                 // Check Reset Button Click
                 if (this.resetButtonRect && this.smartImage.pointInRect(clickPos, this.resetButtonRect)) {
-                    // Reset to default region (centered at 50% of width/height)
-                    this.properties.region = { x1: 0.25, y1: 0.25, x2: 0.75, y2: 0.75 };
+                    if (regionType === "Rectangle") {
+                        // Reset to default rectangle
+                        this.properties.region = { x1: 0.25, y1: 0.25, x2: 0.75, y2: 0.75 };
+                    } else {
+                        // Reset to default triangle
+                        this.properties.points = [
+                            { x: 0.25, y: 0.25 },
+                            { x: 0.75, y: 0.25 },
+                            { x: 0.5, y: 0.75 }
+                        ];
+                    }
                     updateRegionWidget(this);
                     this.setDirtyCanvas(true, true);
                     return true; // Event handled
                 }
 
-                // Check for corner dragging
+                // Polygon-specific buttons
+                if (regionType === "Polygon") {
+                    // Add button
+                    if (this.addButtonRect && this.smartImage.pointInRect(clickPos, this.addButtonRect)) {
+                        const points = this.properties.points;
+                        if (points && points.length >= 3) {
+                            // Add a new point by averaging the last two points
+                            const lastPoint = points[points.length - 1];
+                            const secondLastPoint = points[points.length - 2];
+                            
+                            const newPoint = {
+                                x: (lastPoint.x + secondLastPoint.x) / 2,
+                                y: (lastPoint.y + secondLastPoint.y) / 2
+                            };
+                            
+                            // Offset slightly to make it visible
+                            newPoint.x += 0.05;
+                            newPoint.y += 0.05;
+                            
+                            // Ensure in bounds
+                            newPoint.x = Math.max(0, Math.min(1, newPoint.x));
+                            newPoint.y = Math.max(0, Math.min(1, newPoint.y));
+                            
+                            points.push(newPoint);
+                            updateRegionWidget(this);
+                            this.setDirtyCanvas(true, true);
+                        }
+                        return true; // Event handled
+                    }
+                    
+                    // Remove button (only if we have more than 3 points)
+                    if (this.removeButtonRect && this.smartImage.pointInRect(clickPos, this.removeButtonRect)) {
+                        const points = this.properties.points;
+                        if (points && points.length > 3) {
+                            points.pop(); // Remove the last point
+                            updateRegionWidget(this);
+                            this.setDirtyCanvas(true, true);
+                        }
+                        return true; // Event handled
+                    }
+                }
+
+                // Process region/points dragging based on type
                 if (this.smartImage.imageDrawRect) {
                     const imageRect = this.smartImage.imageDrawRect;
-                    const region = this.properties.region;
                     
-                    // Convert normalized coordinates to canvas coordinates
-                    const x1Canvas = imageRect.x + region.x1 * imageRect.w;
-                    const y1Canvas = imageRect.y + region.y1 * imageRect.h;
-                    const x2Canvas = imageRect.x + region.x2 * imageRect.w;
-                    const y2Canvas = imageRect.y + region.y2 * imageRect.h;
-                    
-                    // Define corner hit areas with zoom adjustment
-                    const baseHandleSize = 12; // Slightly larger than visual size for easier clicking
-                    const canvasScale = app.canvas?.ds?.scale || 1;
-                    const handleSize = baseHandleSize / canvasScale;
-                    
-                    const cornerPoints = [
-                        { x: x1Canvas, y: y1Canvas, id: "tl" }, // Top-left
-                        { x: x2Canvas, y: y1Canvas, id: "tr" }, // Top-right
-                        { x: x1Canvas, y: y2Canvas, id: "bl" }, // Bottom-left
-                        { x: x2Canvas, y: y2Canvas, id: "br" }  // Bottom-right
-                    ];
-                    
-                    // Check if click is on a corner handle
-                    for (const corner of cornerPoints) {
-                        const dx = clickPos.x - corner.x;
-                        const dy = clickPos.y - corner.y;
-                        if (Math.abs(dx) <= handleSize/2 && Math.abs(dy) <= handleSize/2) {
+                    if (regionType === "Rectangle") {
+                        // RECTANGLE DRAG HANDLING
+                        const region = this.properties.region;
+                        
+                        // Convert normalized coordinates to canvas coordinates
+                        const x1Canvas = imageRect.x + region.x1 * imageRect.w;
+                        const y1Canvas = imageRect.y + region.y1 * imageRect.h;
+                        const x2Canvas = imageRect.x + region.x2 * imageRect.w;
+                        const y2Canvas = imageRect.y + region.y2 * imageRect.h;
+                        
+                        // Define corner hit areas with zoom adjustment
+                        const baseHandleSize = 12; // Slightly larger than visual size for easier clicking
+                        const canvasScale = 1;
+                        const handleSize = baseHandleSize / canvasScale;
+                        
+                        const cornerPoints = [
+                            { x: x1Canvas, y: y1Canvas, id: "tl" }, // Top-left
+                            { x: x2Canvas, y: y1Canvas, id: "tr" }, // Top-right
+                            { x: x1Canvas, y: y2Canvas, id: "bl" }, // Bottom-left
+                            { x: x2Canvas, y: y2Canvas, id: "br" }  // Bottom-right
+                        ];
+                        
+                        // Check if click is on a corner handle
+                        for (const corner of cornerPoints) {
+                            const dx = clickPos.x - corner.x;
+                            const dy = clickPos.y - corner.y;
+                            if (Math.abs(dx) <= handleSize/2 && Math.abs(dy) <= handleSize/2) {
+                                this.isDragging = true;
+                                this.dragCorner = corner.id;
+                                this.setDirtyCanvas(true, false);
+                                return true; // Event handled
+                            }
+                        }
+                        
+                        // Check if click is inside rectangle (for moving the entire rectangle)
+                        const rectLeft = Math.min(x1Canvas, x2Canvas);
+                        const rectTop = Math.min(y1Canvas, y2Canvas);
+                        const rectWidth = Math.abs(x2Canvas - x1Canvas);
+                        const rectHeight = Math.abs(y2Canvas - y1Canvas);
+                        
+                        if (clickPos.x >= rectLeft && clickPos.x <= rectLeft + rectWidth &&
+                            clickPos.y >= rectTop && clickPos.y <= rectTop + rectHeight) {
+                            // Store drag start position and region state for move operation
                             this.isDragging = true;
-                            this.dragCorner = corner.id;
+                            this.dragCorner = "move";
+                            this.dragStartPos = { x: clickPos.x, y: clickPos.y };
+                            this.dragStartRegion = { ...this.properties.region };
                             this.setDirtyCanvas(true, false);
                             return true; // Event handled
                         }
-                    }
-                    
-                    // Check if click is inside rectangle (for moving the entire rectangle)
-                    const rectLeft = Math.min(x1Canvas, x2Canvas);
-                    const rectTop = Math.min(y1Canvas, y2Canvas);
-                    const rectWidth = Math.abs(x2Canvas - x1Canvas);
-                    const rectHeight = Math.abs(y2Canvas - y1Canvas);
-                    
-                    if (clickPos.x >= rectLeft && clickPos.x <= rectLeft + rectWidth &&
-                        clickPos.y >= rectTop && clickPos.y <= rectTop + rectHeight) {
-                        // Store drag start position and region state for move operation
-                        this.isDragging = true;
-                        this.dragCorner = "move";
-                        this.dragStartPos = { x: clickPos.x, y: clickPos.y };
-                        this.dragStartRegion = { ...this.properties.region };
-                        this.setDirtyCanvas(true, false);
-                        return true; // Event handled
+                    } else {
+                        // POLYGON DRAG HANDLING
+                        const points = this.properties.points;
+                        if (!points || points.length < 3) return false;
+                        
+                        // Convert normalized coordinates to canvas coordinates
+                        const canvasPoints = points.map(point => ({
+                            x: imageRect.x + point.x * imageRect.w,
+                            y: imageRect.y + point.y * imageRect.h
+                        }));
+                        
+                        // Define vertex hit area size
+                        const baseHandleSize = 12; // Slightly larger than visual for easier clicking
+                        const canvasScale = 1;
+                        const handleSize = baseHandleSize / canvasScale;
+                        
+                        // Check if click is on a vertex handle
+                        for (let i = 0; i < canvasPoints.length; i++) {
+                            const point = canvasPoints[i];
+                            const dx = clickPos.x - point.x;
+                            const dy = clickPos.y - point.y;
+                            
+                            if (Math.abs(dx) <= handleSize/2 && Math.abs(dy) <= handleSize/2) {
+                                this.isDragging = true;
+                                this.dragCorner = i; // Store vertex index
+                                this.setDirtyCanvas(true, false);
+                                return true; // Event handled
+                            }
+                        }
+                        
+                        // Check if click is inside polygon (for moving entire polygon)
+                        // This implementation uses the even-odd rule to check if a point is in a polygon
+                        let isInside = false;
+                        for (let i = 0, j = canvasPoints.length - 1; i < canvasPoints.length; j = i++) {
+                            if (((canvasPoints[i].y > clickPos.y) != (canvasPoints[j].y > clickPos.y)) &&
+                                (clickPos.x < (canvasPoints[j].x - canvasPoints[i].x) * (clickPos.y - canvasPoints[i].y) / 
+                                (canvasPoints[j].y - canvasPoints[i].y) + canvasPoints[i].x)) {
+                                isInside = !isInside;
+                            }
+                        }
+                        
+                        if (isInside) {
+                            // Store drag start position and polygon state for move operation
+                            this.isDragging = true;
+                            this.dragCorner = "move";
+                            this.dragStartPos = { x: clickPos.x, y: clickPos.y };
+                            this.dragStartPoints = JSON.parse(JSON.stringify(this.properties.points)); // Deep copy
+                            this.setDirtyCanvas(true, false);
+                            return true; // Event handled
+                        }
                     }
                 }
 
@@ -323,59 +639,92 @@ app.registerExtension({
             };
 
             nodeType.prototype.onMouseMove = function(e, localPos, graphCanvas) {
-                if (!this.isDragging || !this.dragCorner || !this.smartImage.imageDrawRect) return false;
+                if (!this.isDragging || this.dragCorner === null || !this.smartImage.imageDrawRect) return false;
 
                 const rect = this.smartImage.imageDrawRect;
+                const typeWidget = getTypeWidget(this);
+                const regionType = typeWidget ? typeWidget.value : "Rectangle";
                 
                 // Convert mouse position to normalized image coordinates
                 const mouseNormX = Math.max(0, Math.min(1, (localPos[0] - rect.x) / rect.w));
                 const mouseNormY = Math.max(0, Math.min(1, (localPos[1] - rect.y) / rect.h));
                 
-                // Get current region
-                const region = this.properties.region;
-                
-                if (this.dragCorner === "move") {
-                    // Moving the entire rectangle
-                    // Calculate the delta in canvas coordinates
-                    const deltaCanvasX = localPos[0] - this.dragStartPos.x;
-                    const deltaCanvasY = localPos[1] - this.dragStartPos.y;
+                if (regionType === "Rectangle") {
+                    // RECTANGLE MOVE/RESIZE
+                    // Get current region
+                    const region = this.properties.region;
                     
-                    // Convert to normalized coordinates
-                    const deltaNormX = deltaCanvasX / rect.w;
-                    const deltaNormY = deltaCanvasY / rect.h;
-                    
-                    // Original width and height
-                    const width = this.dragStartRegion.x2 - this.dragStartRegion.x1;
-                    const height = this.dragStartRegion.y2 - this.dragStartRegion.y1;
-                    
-                    // Calculate new position ensuring it stays within bounds
-                    let newX1 = Math.max(0, Math.min(1 - width, this.dragStartRegion.x1 + deltaNormX));
-                    let newY1 = Math.max(0, Math.min(1 - height, this.dragStartRegion.y1 + deltaNormY));
-                    
-                    // Update all corners preserving width/height
-                    region.x1 = newX1;
-                    region.y1 = newY1;
-                    region.x2 = newX1 + width;
-                    region.y2 = newY1 + height;
+                    if (this.dragCorner === "move") {
+                        // Moving the entire rectangle
+                        // Calculate the delta in canvas coordinates
+                        const deltaCanvasX = localPos[0] - this.dragStartPos.x;
+                        const deltaCanvasY = localPos[1] - this.dragStartPos.y;
+                        
+                        // Convert to normalized coordinates
+                        const deltaNormX = deltaCanvasX / rect.w;
+                        const deltaNormY = deltaCanvasY / rect.h;
+                        
+                        // Original width and height
+                        const width = this.dragStartRegion.x2 - this.dragStartRegion.x1;
+                        const height = this.dragStartRegion.y2 - this.dragStartRegion.y1;
+                        
+                        // Calculate new position ensuring it stays within bounds
+                        let newX1 = Math.max(0, Math.min(1 - width, this.dragStartRegion.x1 + deltaNormX));
+                        let newY1 = Math.max(0, Math.min(1 - height, this.dragStartRegion.y1 + deltaNormY));
+                        
+                        // Update all corners preserving width/height
+                        region.x1 = newX1;
+                        region.y1 = newY1;
+                        region.x2 = newX1 + width;
+                        region.y2 = newY1 + height;
+                    } else {
+                        // Dragging a corner
+                        switch (this.dragCorner) {
+                            case "tl": // Top-left
+                                region.x1 = mouseNormX;
+                                region.y1 = mouseNormY;
+                                break;
+                            case "tr": // Top-right
+                                region.x2 = mouseNormX;
+                                region.y1 = mouseNormY;
+                                break;
+                            case "bl": // Bottom-left
+                                region.x1 = mouseNormX;
+                                region.y2 = mouseNormY;
+                                break;
+                            case "br": // Bottom-right
+                                region.x2 = mouseNormX;
+                                region.y2 = mouseNormY;
+                                break;
+                        }
+                    }
                 } else {
-                    // Dragging a corner
-                    switch (this.dragCorner) {
-                        case "tl": // Top-left
-                            region.x1 = mouseNormX;
-                            region.y1 = mouseNormY;
-                            break;
-                        case "tr": // Top-right
-                            region.x2 = mouseNormX;
-                            region.y1 = mouseNormY;
-                            break;
-                        case "bl": // Bottom-left
-                            region.x1 = mouseNormX;
-                            region.y2 = mouseNormY;
-                            break;
-                        case "br": // Bottom-right
-                            region.x2 = mouseNormX;
-                            region.y2 = mouseNormY;
-                            break;
+                    // POLYGON VERTEX MOVE
+                    const points = this.properties.points;
+                    
+                    if (this.dragCorner === "move") {
+                        // Moving the entire polygon
+                        if (!this.dragStartPoints) return false;
+                        
+                        // Calculate the delta in canvas coordinates
+                        const deltaCanvasX = localPos[0] - this.dragStartPos.x;
+                        const deltaCanvasY = localPos[1] - this.dragStartPos.y;
+                        
+                        // Convert to normalized coordinates
+                        const deltaNormX = deltaCanvasX / rect.w;
+                        const deltaNormY = deltaCanvasY / rect.h;
+                        
+                        // Apply delta to all points with bounds checking
+                        for (let i = 0; i < points.length; i++) {
+                            if (i < this.dragStartPoints.length) {
+                                points[i].x = Math.max(0, Math.min(1, this.dragStartPoints[i].x + deltaNormX));
+                                points[i].y = Math.max(0, Math.min(1, this.dragStartPoints[i].y + deltaNormY));
+                            }
+                        }
+                    } else if (typeof this.dragCorner === 'number' && this.dragCorner >= 0 && this.dragCorner < points.length) {
+                        // Moving a specific vertex
+                        points[this.dragCorner].x = mouseNormX;
+                        points[this.dragCorner].y = mouseNormY;
                     }
                 }
                 
@@ -392,6 +741,7 @@ app.registerExtension({
                     this.dragCorner = null;
                     this.dragStartPos = null;
                     this.dragStartRegion = null;
+                    this.dragStartPoints = null;
                     this.setDirtyCanvas(true, false);
                     return true; // Event handled
                 }
