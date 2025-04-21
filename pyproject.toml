@@ -1,0 +1,15 @@
+[project]
+name = "SmartImageTools"
+description = "NODES: Various nodes for image manipulation"
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/slvslvslv/ComfyUI-SmartImageTools"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-SmartImageTools"
+Icon = ""
