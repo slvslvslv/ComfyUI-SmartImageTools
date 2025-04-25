@@ -1232,6 +1232,220 @@ class SmartImageRegion:
         return {"result": (mask_tensor, bbox), "ui": ui_data}
 
 
+class SmartImagePaletteExtract:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                 "max_colors": ("INT", {"default": 255, "min": 1, "max": 255, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("palette", "num_colors")
+    FUNCTION = "extract_palette"
+    CATEGORY = "SmartImageTools"
+
+    # Copied from SmartImagePaletteConvert for consistent sorting
+    @staticmethod
+    def _sort_palette(palette):
+        """Sorts a palette primarily by hue, then luminance, then saturation.
+           Assigns special hue values for gray/transparent colors.
+        """
+        if palette.shape[0] <= 1:
+            return palette
+
+        has_alpha = palette.shape[1] == 4
+        color_data = [] # List to store (sort_key, original_color)
+
+        for color_val in palette:
+            rgb = color_val[:3] / 255.0
+            alpha = color_val[3] / 255.0 if has_alpha else 1.0
+            is_transparent = has_alpha and color_val[3] == 0
+
+            h, l, s = colorsys.rgb_to_hls(rgb[0], rgb[1], rgb[2])
+
+            # Define hue_value for sorting
+            # -2: Transparent
+            # -1: Achromatic (Gray/Black/White)
+            # 0-1: Chromatic hue
+            if is_transparent:
+                hue_value = -2
+                l = 0.0 # Use luminance of black for sorting transparent
+                s = 0.0
+            elif s < 0.05 or l < 0.01 or l > 0.99: # Achromatic threshold
+                hue_value = -1
+            else:
+                hue_value = h
+
+            sort_key = (hue_value, l, s)
+            color_data.append((sort_key, color_val))
+
+        color_data.sort(key=lambda x: x[0])
+        sorted_palette_list = [item[1] for item in color_data]
+        return np.array(sorted_palette_list, dtype=palette.dtype)
+
+    def extract_palette(self, image, max_colors=255):
+        input_image = 255. * image.cpu().numpy()
+        # Process only the first image in the batch
+        img = input_image[0].astype(np.uint8)
+        h, w, channels = img.shape
+        has_alpha = channels == 4
+
+        # Reshape to get all pixels
+        img_flat = img.reshape(-1, channels)
+
+        # Get unique colors
+        unique_colors = np.unique(img_flat, axis=0)
+        num_unique = len(unique_colors)
+
+        if num_unique > max_colors:
+            raise ValueError(f"Image contains {num_unique} unique colors, exceeding the limit of {max_colors}.")
+
+        # Sort the palette
+        sorted_palette = self._sort_palette(unique_colors)
+
+        # Create palette image (1 pixel high)
+        palette_height = 1
+        palette_width = len(sorted_palette)
+        palette_img = np.zeros((palette_height, palette_width, channels), dtype=np.uint8)
+
+        if palette_width > 0:
+             for i in range(palette_width):
+                 palette_img[:, i] = sorted_palette[i]
+
+        # Convert to tensor (add batch dimension and normalize)
+        palette_tensor = torch.from_numpy(palette_img[np.newaxis, ...] / 255.0).float()
+
+        return (palette_tensor, num_unique)
+
+
+class SmartSemiTransparenceRemove:
+    # Define color map with RGB values (0-1 range for easier blending)
+    COLOR_MAP = {
+        "red": [1.0, 0.0, 0.0],
+        "green": [0.0, 1.0, 0.0],
+        "blue": [0.0, 0.0, 1.0],
+        "black": [0.0, 0.0, 0.0],
+        "white": [1.0, 1.0, 1.0],
+        "yellow": [1.0, 1.0, 0.0],
+        "cyan": [0.0, 1.0, 1.0],
+        "magenta": [1.0, 0.0, 1.0],
+        "gray": [0.5, 0.5, 0.5],
+        "orange": [1.0, 0.647, 0.0],
+        "purple": [0.5, 0.0, 0.5],
+        "brown": [0.647, 0.165, 0.165],
+        "pink": [1.0, 0.753, 0.796],
+    }
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "blend_color": (list(s.COLOR_MAP.keys()),),
+                "threshold": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "over_threshold": (["Blend", "Fill blend color"],),
+                "fill_threshold": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "remove_transparence"
+    CATEGORY = "SmartImageTools"
+
+    def remove_transparence(self, image, blend_color, threshold, over_threshold="Blend", fill_threshold=0.95):
+        batch_size, height, width, channels = image.shape
+        device = image.device
+        dtype = image.dtype
+
+        # Get blend color RGB values
+        blend_rgb = torch.tensor(self.COLOR_MAP[blend_color], device=device, dtype=dtype)
+
+        # Clone image to avoid modifying original tensor
+        result_image = image.clone()
+
+        # Ensure image has alpha channel
+        if channels == 3:
+            # Add alpha channel, initialize to fully opaque
+            alpha_channel = torch.ones((batch_size, height, width, 1), device=device, dtype=dtype)
+            result_image = torch.cat((result_image, alpha_channel), dim=3)
+        elif channels != 4:
+            raise ValueError("Input image must have 3 (RGB) or 4 (RGBA) channels.")
+
+        # Process pixels
+        alpha = result_image[:, :, :, 3]
+        rgb = result_image[:, :, :, :3]
+
+        # Condition 1: Alpha is 1 (fully opaque) - do nothing, alpha already 1
+
+        # Condition 2: Alpha < threshold - make fully transparent
+        mask_transparent = alpha < threshold # Shape [B, H, W]
+        num_transparent_pixels = mask_transparent.sum()
+
+        if num_transparent_pixels > 0:
+            # Set alpha channel to 0 using masked assignment on the slice
+            result_image[:, :, :, 3][mask_transparent] = 0.0
+            # Set RGB channels to 0 using masked assignment on the slice
+            result_image[:, :, :, :3][mask_transparent] = 0.0
+
+        if over_threshold == "Blend":
+            # Original behavior: blend all semi-transparent pixels
+            # Condition 3: threshold <= Alpha < 1 - blend and make fully opaque
+            mask_blend = (alpha >= threshold) & (alpha < 1.0) # Shape [B, H, W]
+            num_blend_pixels = mask_blend.sum()
+
+            if num_blend_pixels > 0:
+                # Expand alpha and blend_rgb for broadcasting
+                alpha_expanded = alpha[mask_blend].unsqueeze(-1) # Shape: [num_blend_pixels, 1]
+                blend_rgb_expanded = blend_rgb.unsqueeze(0)     # Shape: [1, 3]
+
+                # Calculate blended RGB for the relevant pixels
+                original_rgb_subset = rgb[mask_blend]           # Shape: [num_blend_pixels, 3]
+                blended_rgb = original_rgb_subset * alpha_expanded + blend_rgb_expanded * (1.0 - alpha_expanded) # Shape: [num_blend_pixels, 3]
+
+                # Assign blended RGB back to the result image using the mask on the sliced tensor
+                result_image[:, :, :, :3][mask_blend] = blended_rgb
+
+                # Set alpha to 1 for these pixels using the mask on the sliced tensor
+                result_image[:, :, :, 3][mask_blend] = 1.0
+        else:
+            # "Fill blend color" mode
+            # Pixels with threshold <= alpha < fill_threshold: filled with blend color
+            mask_fill = (alpha >= threshold) & (alpha < fill_threshold) # Shape [B, H, W]
+            num_fill_pixels = mask_fill.sum()
+
+            if num_fill_pixels > 0:
+                # Fill with blend color (no blending)
+                result_image[:, :, :, :3][mask_fill] = blend_rgb.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                # Set alpha to 1
+                result_image[:, :, :, 3][mask_fill] = 1.0
+
+            # Pixels with fill_threshold <= alpha < 1.0: blended normally
+            mask_blend = (alpha >= fill_threshold) & (alpha < 1.0) # Shape [B, H, W]
+            num_blend_pixels = mask_blend.sum()
+
+            if num_blend_pixels > 0:
+                # Expand alpha and blend_rgb for broadcasting
+                alpha_expanded = alpha[mask_blend].unsqueeze(-1) # Shape: [num_blend_pixels, 1]
+                blend_rgb_expanded = blend_rgb.unsqueeze(0)     # Shape: [1, 3]
+
+                # Calculate blended RGB for the relevant pixels
+                original_rgb_subset = rgb[mask_blend]           # Shape: [num_blend_pixels, 3]
+                blended_rgb = original_rgb_subset * alpha_expanded + blend_rgb_expanded * (1.0 - alpha_expanded) # Shape: [num_blend_pixels, 3]
+
+                # Assign blended RGB back to the result image using the mask on the sliced tensor
+                result_image[:, :, :, :3][mask_blend] = blended_rgb
+
+                # Set alpha to 1 for these pixels using the mask on the sliced tensor
+                result_image[:, :, :, 3][mask_blend] = 1.0
+
+        return (result_image,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
@@ -1244,6 +1458,8 @@ NODE_CLASS_MAPPINGS = {
     "SmartPreviewPalette": SmartPreviewPalette,
     "SmartImagePoint": SmartImagePoint,
     "SmartImageRegion": SmartImageRegion,
+    "SmartImagePaletteExtract": SmartImagePaletteExtract,
+    "SmartSemiTransparenceRemove": SmartSemiTransparenceRemove,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1258,4 +1474,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartPreviewPalette": "Smart Preview Palette",
     "SmartImagePoint": "Smart Image Point",
     "SmartImageRegion": "Smart Image Region",
+    "SmartImagePaletteExtract": "Smart Image Palette Extract",
+    "SmartSemiTransparenceRemove": "Smart Semi-Transparence Remove",
 } 
