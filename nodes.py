@@ -1,5 +1,6 @@
 import numpy as np
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo # Added import
 from sklearn.cluster import KMeans
 from skimage import color
 import torch
@@ -17,6 +18,7 @@ import base64
 import colorsys
 import json
 import math # Added for ceil/floor
+import struct
 
 # Numba optimized functions
 @numba.jit(nopython=True)
@@ -251,19 +253,25 @@ class SmartImagePaletteConvert:
             rgb_opaque = img_flat[mask]
 
             # Get unique RGB colors (ignore alpha variations for same RGB)
-            unique_colors = np.unique(rgb_opaque[:, :3], axis=0)
+            # Work with float representation internally for potential negative values
+            unique_colors_float = np.unique(rgb_opaque[:, :3], axis=0).astype(np.float32)
 
-            # Create final palette with alpha channel
-            palette = np.zeros((len(unique_colors) + 1, 4), dtype=np.uint8)
-            palette[:len(unique_colors), :3] = unique_colors
-            palette[:len(unique_colors), 3] = 255  # Full opacity
-            palette[-1] = [0, 0, 0, 0]  # Add transparent color
+            # Create final palette with alpha channel using float32
+            palette = np.zeros((len(unique_colors_float) + 1, 4), dtype=np.float32)
+            palette[:len(unique_colors_float), :3] = unique_colors_float
+            palette[:len(unique_colors_float), 3] = 255.0  # Full opacity
+            # Use large negative RGB for transparent color temporarily (this is needed to cancel the transparent color from picking it while searching for the closest color)
+            palette[-1] = [-99999.0, -99999.0, -99999.0, 0.0]
         else:
             # No alpha channel, just get unique RGB colors
             unique_colors = np.unique(img_flat, axis=0)
-            palette = unique_colors
+            # Convert to float32 for consistency
+            palette = unique_colors.astype(np.float32)
 
-        return self._sort_palette(palette)
+        # Sorting works fine with floats
+        sorted_palette_float = self._sort_palette(palette)
+        # Return as uint8 after sorting and potential modification
+        return np.clip(sorted_palette_float, 0, 255).astype(np.uint8)
 
     def generate_palette(self, img, num_colors, has_transparency=True):
         """Generate an optimal color palette using K-means clustering in CIELAB space."""
@@ -319,44 +327,46 @@ class SmartImagePaletteConvert:
         centers_rgb = color.lab2rgb(centers_lab.reshape(-1, 1, 3)).reshape(-1, 3)
         centers_rgb = (centers_rgb * 255).astype(np.uint8)
 
-        # Enhance vibrance - Find max intensity in original image and adjust palette
-        max_intensity_orig = np.max(rgb, axis=0)
-        max_intensity_palette = np.max(centers_rgb, axis=0)
-
-        # Only increase intensity, don't decrease it
-        scale_factors = np.maximum(max_intensity_orig / np.maximum(max_intensity_palette, 1), 1)
-
-        # Apply scaling while keeping colors within valid range (vectorized)
-        scaled = centers_rgb * scale_factors[np.newaxis, :]
-        centers_rgb = np.clip(scaled, 0, 255).astype(np.uint8)
+        # Use float32 for palette to accommodate potential negative values
+        centers_rgb_float = centers_rgb.astype(np.float32)
 
         # Add transparency color if needed
         if has_transparency:
-            transparent_color = np.array([0, 0, 0, 0], dtype=np.uint8)
+            # Use large negative RGB for transparent color temporarily, use float32
+            transparent_color = np.array([-99999.0, -99999.0, -99999.0, 0.0], dtype=np.float32)
             if img.shape[2] == 4:
-                # Create palette with RGBA values
-                palette = np.zeros((colors_to_extract + 1, 4), dtype=np.uint8)
-                palette[:-1, :3] = centers_rgb
-                palette[:-1, 3] = 255  # Full opacity for color entries
-                palette[-1] = transparent_color  # Last entry is transparent
+                # Create palette with RGBA values using float32
+                palette = np.zeros((colors_to_extract + 1, 4), dtype=np.float32)
+                palette[:-1, :3] = centers_rgb_float
+                palette[:-1, 3] = 255.0  # Full opacity for color entries
+                palette[-1] = transparent_color  # Last entry is transparent (with modified RGB)
             else:
-                # Create palette with RGB values
-                palette = np.zeros((colors_to_extract + 1, 3), dtype=np.uint8)
-                palette[:-1] = centers_rgb
-                palette[-1] = transparent_color[:3]  # Last entry is "transparent" (black)
+                # Create palette with RGB values using float32
+                palette = np.zeros((colors_to_extract + 1, 3), dtype=np.float32)
+                palette[:-1] = centers_rgb_float
+                palette[-1] = transparent_color[:3] # RGB part of modified transparent
         else:
             # No transparency needed
             if img.shape[2] == 4:
-                palette = np.zeros((colors_to_extract, 4), dtype=np.uint8)
-                palette[:, :3] = centers_rgb
-                palette[:, 3] = 255
+                # Use float32
+                palette = np.zeros((colors_to_extract, 4), dtype=np.float32)
+                palette[:, :3] = centers_rgb_float
+                palette[:, 3] = 255.0
             else:
-                palette = centers_rgb
+                # Use float32
+                palette = centers_rgb_float
 
-        return self._sort_palette(palette)
+        # Sorting works fine with floats
+        sorted_palette_float = self._sort_palette(palette)
+        # Return palette as uint8 after processing is complete in convert_image
+        # Keep it as float32 internally for dithering/mapping
+        return sorted_palette_float # Return float palette
 
     def apply_floyd_steinberg_dithering(self, img, palette, dithering_amount=1.0):
         """Apply Floyd-Steinberg dithering with variable amount and optimizations."""
+        # Ensure palette is float32 for internal processing
+        palette_float = palette.astype(np.float32)
+
         if dithering_amount <= 0:
             # If no dithering, just do direct color mapping (already vectorized)
             has_alpha = img.shape[2] == 4
@@ -365,80 +375,94 @@ class SmartImagePaletteConvert:
             # Determine the transparent color index from the palette
             transparent_idx = -1
             if has_alpha:
-                for i, color in enumerate(palette):
-                    if color[3] == 0:
-                        transparent_idx = i
-                        break
-                if transparent_idx == -1:
-                    transparent_idx = len(palette) -1 # Default if not found (shouldn't happen if generated correctly)
+                # Find index where alpha is 0
+                alpha_channel = palette_float[:, 3]
+                transparent_indices = np.where(alpha_channel == 0.0)[0]
+                if len(transparent_indices) > 0:
+                    transparent_idx = transparent_indices[0] # Take the first one
+                # else: # Should not happen if generated correctly
+                #     print("Warning: No transparent color (alpha=0) found in palette for direct mapping.")
+                #     # Fallback: maybe use the one with modified RGB if that helps?
+                #     # Or just map to closest non-transparent? For now, let it map.
+
+
+            # Use palette RGB for distance calculation (will include -99999 if present)
+            palette_rgb = palette_float[:, :3]
 
             if has_alpha:
-                # Handle transparent pixels
-                mask = img_flat[:, 3] < 1
+                # Handle transparent pixels in the source image
+                mask = img_flat[:, 3] < 1 # Check alpha channel of source image
 
-                # Find closest color for non-transparent pixels
-                # Use palette without alpha for distance calculation
-                palette_rgb = palette[:, :3]
-                closest_colors, _ = SmartImagePaletteConvert.find_closest_color_vectorized(img_flat[~mask, :3], palette_rgb)
+                # Find closest color for non-transparent pixels using palette_rgb
+                closest_colors_indices = np.zeros(img_flat.shape[0], dtype=int) # Placeholder shape
+                non_transparent_mask = ~mask
+                if np.any(non_transparent_mask):
+                     closest_colors_non_transparent, indices_non_transparent = SmartImagePaletteConvert.find_closest_color_vectorized(
+                         img_flat[non_transparent_mask, :3], palette_rgb
+                     )
+                     closest_colors_indices[non_transparent_mask] = indices_non_transparent
 
-                # Create result array
-                result_flat = np.zeros_like(img_flat)
+                # Create result array (needs to be float initially if palette is float)
+                result_flat = np.zeros_like(img_flat, dtype=np.float32)
 
-                # Set non-transparent pixels (reconstruct RGBA using palette alpha)
-                mapped_rgba = palette[_, :][closest_colors] # Get full RGBA from palette indices
-                result_flat[~mask] = mapped_rgba
+                # Map non-transparent pixels using the full palette (incl alpha and modified RGB)
+                if np.any(non_transparent_mask):
+                     result_flat[non_transparent_mask] = palette_float[closest_colors_indices[non_transparent_mask]]
 
-                # Set transparent pixels to the palette's transparent color
-                result_flat[mask] = palette[transparent_idx]
+                # Set transparent pixels to the palette's transparent color (using index)
+                if transparent_idx != -1 and np.any(mask):
+                    result_flat[mask] = palette_float[transparent_idx]
+                elif np.any(mask): # If transparent pixels exist but no transparent color in palette
+                     # Fallback: Make them black with 0 alpha? Or handle error?
+                     # Let's make them black and transparent
+                     result_flat[mask, :3] = 0.0
+                     result_flat[mask, 3] = 0.0
+
+
             else:
                 # No transparency - simple mapping
-                closest_colors, _ = SmartImagePaletteConvert.find_closest_color_vectorized(img_flat, palette)
-                # result_flat = closest_colors # This was wrong, needs indexing
-                result_flat = palette[closest_colors]
+                closest_colors, indices = SmartImagePaletteConvert.find_closest_color_vectorized(img_flat, palette_rgb)
+                result_flat = palette_float[indices]
 
 
-            return result_flat.reshape(img.shape)
+            # Reshape and convert to uint8 at the end
+            return np.clip(result_flat, 0, 255).reshape(img.shape).astype(np.uint8)
+
 
         # --- Use Numba for dithering > 0 ---
         has_alpha = img.shape[2] == 4
         img_float = img.astype(np.float32)
 
         # Create a palette view without alpha for color comparisons if needed
-        palette_rgb = palette[:, :3].copy() # Numba needs contiguous arrays sometimes
+        # Numba needs contiguous arrays sometimes
+        palette_rgb = np.ascontiguousarray(palette_float[:, :3])
 
         # Pre-calculate transparent index if needed
         transparent_idx = -1
         if has_alpha:
-            for i, color in enumerate(palette):
-                if color[3] == 0:
-                    transparent_idx = i
-                    break
-            if transparent_idx == -1 and len(palette) > 0:
-                 # If not explicitly found, assume last entry might be transparent (fallback)
-                 # Or handle error if transparency expected but not found
-                 # For safety, we might default to last index if generated palette ensures it.
-                 # Check if last entry IS transparent, otherwise no transparent color available
-                 if palette[-1][3] == 0:
-                     transparent_idx = len(palette) - 1
-                 # else: transparent_idx remains -1, Numba func should handle
+             alpha_channel = palette_float[:, 3]
+             transparent_indices = np.where(alpha_channel == 0.0)[0]
+             if len(transparent_indices) > 0:
+                 transparent_idx = transparent_indices[0]
+             # else: # Handle case where no transparent color found if necessary
+             #     print("Warning: No transparent color (alpha=0) found in palette for dithering.")
 
-        # Ensure palette is contiguous float32 for Numba function
-        palette_float = palette.astype(np.float32)
 
-        # Call the Numba JIT function
+        # Call the Numba JIT function (expects float32 palette)
         result_dithered = _apply_floyd_steinberg_dithering_numba(
             img_float,
-            palette_float,
-            palette_rgb.astype(np.float32), # Pass RGB part for distance calc
+            palette_float, # Pass full float palette (with modified RGB, correct alpha)
+            palette_rgb,   # Pass float RGB part (with modified RGB) for distance calc
             dithering_amount,
             has_alpha,
             transparent_idx
         )
-
+        # Numba function already returns uint8
         return result_dithered
 
     def process_image(self, image, palette, dithering_amount):
         """Process a single image with the given palette."""
+        # Palette is expected to be float32 here
         return self.apply_floyd_steinberg_dithering(image, palette, dithering_amount)
 
     def convert_image(self, image, num_colors, dithering_amount, reference_image=None):
@@ -449,10 +473,21 @@ class SmartImagePaletteConvert:
         if reference_image is not None:
             reference_np = 255. * reference_image.cpu().numpy()
             # Extract exact palette from reference image, ignoring num_colors
-            palette = self.extract_palette_from_reference(reference_np[0])
+            # This will return uint8 initially
+            palette_uint8 = self.extract_palette_from_reference(reference_np[0])
+            # Convert to float32 for internal processing
+            palette_float = palette_uint8.astype(np.float32)
+             # Ensure transparent color has modified RGB if present
+            alpha_channel = palette_float[:, 3]
+            transparent_indices = np.where(alpha_channel == 0.0)[0]
+            if len(transparent_indices) > 0:
+                palette_float[transparent_indices, :3] = -99999.0
+
         else:
             # Generate optimal palette from the input image using num_colors
-            palette = self.generate_palette(input_image[0], num_colors)
+            # Returns float32 palette with modified transparent color already
+            palette_float = self.generate_palette(input_image[0], num_colors)
+
 
         # Create output array with same batch size as input
         batch_size = input_image.shape[0]
@@ -460,7 +495,8 @@ class SmartImagePaletteConvert:
         # Use ThreadPoolExecutor for parallel processing of batch images
         with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(self.process_image, input_image[i], palette, dithering_amount)
+                # Pass the float palette to process_image
+                executor.submit(self.process_image, input_image[i], palette_float, dithering_amount)
                 for i in range(batch_size)
             ]
 
@@ -469,15 +505,30 @@ class SmartImagePaletteConvert:
         # Convert back to tensor
         output_tensor = torch.from_numpy(np.stack(output_images) / 255.0).float()
 
+        # --- Restore transparent color RGB in the palette before output ---
+        # Work on a copy to not affect potential future uses if palette is cached etc.
+        final_palette = palette_float.copy()
+        if final_palette.shape[1] == 4: # Check if alpha channel exists
+            alpha_channel = final_palette[:, 3]
+            transparent_indices = np.where(alpha_channel == 0.0)[0]
+            if len(transparent_indices) > 0:
+                 # Set RGB of transparent colors back to 0
+                 final_palette[transparent_indices, :3] = 0.0
+
+        # Clip and convert the final palette to uint8 for the output tensor
+        final_palette_uint8 = np.clip(final_palette, 0, 255).astype(np.uint8)
+        # --- End Restoration ---
+
         # Create palette image (1 pixel high, with each color in the **sorted** palette)
         palette_height = 1
-        palette_width = len(palette)
-        # Create a NumPy array for the palette image
-        palette_img = np.zeros((palette_height, palette_width, palette.shape[1]), dtype=np.uint8)
+        palette_width = len(final_palette_uint8)
+        # Create a NumPy array for the palette image using the restored uint8 palette
+        palette_img = np.zeros((palette_height, palette_width, final_palette_uint8.shape[1]), dtype=np.uint8)
 
-        # Fill each column with a color from the palette
-        for i in range(palette_width):
-            palette_img[:, i] = palette[i]
+        # Fill each column with a color from the final uint8 palette
+        if palette_width > 0:
+            for i in range(palette_width):
+                palette_img[:, i] = final_palette_uint8[i]
 
         # Convert to tensor (add batch dimension and normalize to 0-1 range)
         palette_tensor = torch.from_numpy(palette_img[np.newaxis, ...] / 255.0).float()
@@ -920,8 +971,8 @@ class SmartImagePreviewScaled(PreviewImage):
         return {
             "required": {
                 "images": ("IMAGE",),
-                # Allow both FLOAT and INT for scale_by
-                "scale_by": ("FLOAT,INT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1}),
+                # Change to FLOAT widget
+                "scale_by": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1446,6 +1497,232 @@ class SmartSemiTransparenceRemove:
         return (result_image,)
 
 
+# Color map for background blending (0-255 range)
+BG_COLOR_MAP = {
+    "transparent": None, # Special case
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "gray": (128, 128, 128),
+    "orange": (255, 165, 0),
+    "purple": (128, 0, 128),
+    "brown": (165, 42, 42),
+    "pink": (255, 192, 203),
+}
+
+class SmartVideoPreviewScaled:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 12.0, "min": 0.1, "max": 60.0, "step": 1}),
+                "scale_by": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "bg_color": (list(BG_COLOR_MAP.keys()), {"default": "transparent"}), # Added bg_color
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "preview_video"
+    OUTPUT_NODE = True
+    CATEGORY = "SmartNodes/Image"
+
+    def preview_video(self, images, fps, scale_by=2.0, bg_color="transparent", prompt=None, extra_pnginfo=None):
+        # Convert tensors to PIL images and prepare for web UI
+        image_data = []
+        for image_tensor in images:
+            img_np = image_tensor.cpu().numpy()
+            # Handle potential non-standard ranges by clipping before conversion
+            img_np = np.clip(img_np, 0.0, 1.0)
+            img_pil = Image.fromarray((img_np * 255.0).astype(np.uint8))
+
+            # --- Scaling happens here ---
+            if abs(scale_by - 1.0) > 1e-6 and scale_by > 0:
+                w, h = img_pil.size
+                new_w = max(1, int(round(w * scale_by)))
+                new_h = max(1, int(round(h * scale_by)))
+                # Resize using NEAREST neighbor
+                img_pil = img_pil.resize((new_w, new_h), Image.NEAREST)
+            # --- End Scaling ---
+
+            # --- Background Blending --- 
+            if bg_color != "transparent" and bg_color in BG_COLOR_MAP:
+                blend_rgb = BG_COLOR_MAP[bg_color]
+                if blend_rgb is not None:
+                    # Ensure image is RGBA for compositing
+                    if img_pil.mode != 'RGBA':
+                        img_pil = img_pil.convert('RGBA')
+                    
+                    # Create a background image of the solid color
+                    background = Image.new('RGBA', img_pil.size, blend_rgb + (255,))
+                    
+                    # Composite the original image over the background
+                    # This automatically handles the alpha blending
+                    img_pil = Image.alpha_composite(background, img_pil)
+            # --- End Background Blending ---
+
+            # Save the (potentially scaled and blended) image to a temporary location
+            output_dir = folder_paths.get_temp_directory()
+            filename = f"smart_video_frame_{random.randint(1000000, 9999999)}.png" # Add randomness to filename
+            file_path = os.path.join(output_dir, filename) # Use os.path.join
+            img_pil.save(file_path)
+            image_data.append({
+                "filename": filename,
+                "subfolder": "", # Saved directly in temp
+                "type": "temp"
+            })
+
+        # Only send images and fps
+        # Use a unique key 'video_frames' to avoid conflicts with default preview handlers
+        return {"ui": {"video_frames": image_data, "fps": [fps]}}
+
+
+class SmartSaveAnimatedPNG:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", ),
+                "fps": ("FLOAT", {"default": 12.0, "min": 0.1, "max": 1000.0, "step": 0.1}),
+                "filename_prefix": ("STRING", {"default": "ComfyUI"}),
+                # Keep lossy_quality for potential future use, but set default high
+                "lossless": ("BOOLEAN", {"default": True}),
+             },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_apng"
+    OUTPUT_NODE = True
+    CATEGORY = "SmartImageTools"
+
+    def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, prompt=None, extra_pnginfo=None):
+        full_output_folder, filename, counter, subfolder, filename_prefix_ = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+        # Extract the base filename part from the potentially path-like filename_prefix_
+        base_filename = os.path.basename(filename_prefix_)
+        # Use a single filename, not numbered sequence
+        file = f"{base_filename}.apng" # Use the extracted base name
+        file_path = os.path.join(full_output_folder, file)
+
+        num_frames = images.shape[0]
+        fps_int = int(round(fps * 100)) # Multiply by 100 and convert to int
+
+        results = list()
+
+        try:
+            with open(file_path, 'wb') as f:
+                # Write header: num_frames (int), fps_int (int)
+                # Use '<i' for 4-byte signed integer, little-endian
+                f.write(struct.pack('<i', num_frames))
+                f.write(struct.pack('<i', fps_int))
+
+                # Process and write each frame
+                for image_tensor in images:
+                    # Convert tensor [0, 1] float -> numpy [0, 255] uint8
+                    img_np = image_tensor.cpu().numpy()
+                    img_np = np.clip(img_np, 0.0, 1.0)
+                    img_uint8 = (img_np * 255.0).astype(np.uint8)
+                    img_pil = Image.fromarray(img_uint8)
+
+                    # Save PIL image to bytes buffer as PNG
+                    buffer = io.BytesIO()
+                    # Determine PNG save options based on lossless flag
+                    pnginfo = None
+                    if prompt is not None:
+                        pnginfo = PngInfo()
+                        if extra_pnginfo is not None:
+                            for key in extra_pnginfo:
+                                pnginfo.add_text(key, json.dumps(extra_pnginfo[key]))
+                        pnginfo.add_text("prompt", json.dumps(prompt))
+
+                    save_opts = {"pnginfo": pnginfo}
+                    if not lossless:
+                        # While PNG is typically lossless, PIL allows 'compress_level'
+                        # 0 = no compression, 1 = fastest, 9 = best compression (slowest)
+                        # Let's default to a moderate level if lossless=False, though it's still lossless compression
+                        # If a truly lossy format were desired, we'd need WebP or similar.
+                        # For simplicity here, we just vary compression level.
+                        save_opts["compress_level"] = 4 # Moderate compression if "lossless" is false
+                    else:
+                        save_opts["compress_level"] = 1 # Faster compression if lossless is true
+
+                    img_pil.save(buffer, format="PNG", **save_opts)
+                    png_data = buffer.getvalue()
+                    png_length = len(png_data)
+
+                    # Write frame data: png_length (int), png_data (binary)
+                    f.write(struct.pack('<i', png_length))
+                    f.write(png_data)
+
+            results.append({
+                "filename": file,
+                "subfolder": subfolder,
+                "type": self.type
+            })
+
+        except Exception as e:
+            print(f"Error saving custom APNG file: {e}")
+            # Optionally re-raise or handle the error appropriately
+            raise
+
+        # Return UI data indicating the saved file
+        return {"ui": {"apng": results}}
+
+
+class SmartSavePNG:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", ),
+                "filename": ("STRING", {"default": "C:/output.png"}),
+             },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "save_png"
+    OUTPUT_NODE = True
+    CATEGORY = "SmartImageTools"
+
+    def save_png(self, images, filename, prompt=None, extra_pnginfo=None):
+        # Get the first image from the batch
+        image_tensor = images[0] if len(images.shape) > 3 else images
+        
+        # Convert tensor [0, 1] float -> numpy [0, 255] uint8
+        img_np = image_tensor.cpu().numpy()
+        img_np = np.clip(img_np, 0.0, 1.0)
+        img_uint8 = (img_np * 255.0).astype(np.uint8)
+        img_pil = Image.fromarray(img_uint8)
+        
+        # Create PngInfo metadata if needed
+        pnginfo = None
+        if prompt is not None:
+            pnginfo = PngInfo()
+            if extra_pnginfo is not None:
+                for key in extra_pnginfo:
+                    pnginfo.add_text(key, json.dumps(extra_pnginfo[key]))
+            pnginfo.add_text("prompt", json.dumps(prompt))
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+        
+        # Save the image
+        img_pil.save(filename, format="PNG", pnginfo=pnginfo)
+        
+        return (images,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
@@ -1460,6 +1737,9 @@ NODE_CLASS_MAPPINGS = {
     "SmartImageRegion": SmartImageRegion,
     "SmartImagePaletteExtract": SmartImagePaletteExtract,
     "SmartSemiTransparenceRemove": SmartSemiTransparenceRemove,
+    "SmartVideoPreviewScaled": SmartVideoPreviewScaled,
+    "SmartSaveAnimatedPNG": SmartSaveAnimatedPNG,
+    "SmartSavePNG": SmartSavePNG
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1476,4 +1756,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartImageRegion": "Smart Image Region",
     "SmartImagePaletteExtract": "Smart Image Palette Extract",
     "SmartSemiTransparenceRemove": "Smart Semi-Transparence Remove",
+    "SmartVideoPreviewScaled": "Smart Video Preview Scaled",
+    "SmartSaveAnimatedPNG": "Smart Save Animated PNG",
+    "SmartSavePNG": "Smart Save PNG"
 } 
