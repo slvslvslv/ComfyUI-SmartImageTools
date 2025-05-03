@@ -153,7 +153,7 @@ class SmartImagePaletteConvert:
             "required": {
                 "image": ("IMAGE",),
                 "num_colors": ("INT", {"default": 8, "min": 2, "max": 256, "step": 1}),
-                "dithering_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "dithering_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "display": "slider"}),
             },
             "optional": {
                 "reference_image": ("IMAGE",),
@@ -478,10 +478,11 @@ class SmartImagePaletteConvert:
             # Convert to float32 for internal processing
             palette_float = palette_uint8.astype(np.float32)
              # Ensure transparent color has modified RGB if present
-            alpha_channel = palette_float[:, 3]
-            transparent_indices = np.where(alpha_channel == 0.0)[0]
-            if len(transparent_indices) > 0:
-                palette_float[transparent_indices, :3] = -99999.0
+            if palette_float.shape[1] == 4: # Check if alpha channel exists
+                alpha_channel = palette_float[:, 3]
+                transparent_indices = np.where(alpha_channel == 0.0)[0]
+                if len(transparent_indices) > 0:
+                    palette_float[transparent_indices, :3] = -99999.0
 
         else:
             # Generate optimal palette from the input image using num_colors
