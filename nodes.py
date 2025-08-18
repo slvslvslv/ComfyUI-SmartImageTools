@@ -44,12 +44,15 @@ def _apply_floyd_steinberg_dithering_numba(img_float, palette, palette_rgb, dith
         # Precompute alpha mask
         alpha_mask = result[:, :, 3] < 1.0
         # Set transparent pixels directly
+        # transparent_idx != -1 implies palette is RGBA and has a defined transparent entry
         if transparent_idx != -1:
-             transparent_color = palette[transparent_idx].astype(np.float32)
+             transparent_palette_entry = palette[transparent_idx].astype(np.float32)
              for y in numba.prange(height): # Use prange for potential parallelization
                  for x in range(width):
                      if alpha_mask[y, x]:
-                         result[y, x] = transparent_color
+                         # Since transparent_idx != -1, palette[transparent_idx] is RGBA.
+                         # result is also RGBA because has_alpha is true.
+                         result[y, x] = transparent_palette_entry
     else:
         # Create a dummy mask if no alpha
         alpha_mask = np.zeros((height, width), dtype=numba.boolean)
@@ -66,28 +69,35 @@ def _apply_floyd_steinberg_dithering_numba(img_float, palette, palette_rgb, dith
 
             # Find closest color in the RGB palette
             closest_idx = _find_closest_color_numba(old_pixel_rgb, palette_rgb)
-            new_pixel = palette[closest_idx].astype(np.float32) # Use full palette (incl. alpha)
+            
+            # Get the RGB values from palette_rgb (which is always N,3)
+            quantized_rgb = palette_rgb[closest_idx]
+            result[y, x, :3] = quantized_rgb # Assign new RGB
 
-            # Update the pixel in the result image
-            result[y, x] = new_pixel
+            # Handle alpha channel for the current pixel in result
+            if has_alpha: # If original image has alpha channel
+                if palette.shape[1] == 4: # If palette also has alpha channel
+                    result[y, x, 3] = palette[closest_idx, 3] # Use alpha from palette
+                # Else (image has alpha, but palette is RGB): 
+                # alpha of result[y,x,3] retains its original value from img_float (result is a copy).
+            # Else (original image is RGB): result has only 3 channels, nothing to do for alpha.
 
-            # Calculate error (only for RGB channels)
-            # Alpha error is not typically diffused in dithering
-            error = old_pixel - new_pixel
+            # Calculate error only for RGB channels
+            error_rgb = old_pixel_rgb - quantized_rgb # error_rgb is a 3-element array
 
-            # Distribute the error
+            # Distribute the RGB error to RGB channels of neighbors
             for i in range(len(err_weights_dx)):
                 nx, ny = x + err_weights_dx[i], y + err_weights_dy[i]
 
                 # Check bounds
                 if 0 <= nx < width and 0 <= ny < height:
-                     # Don't distribute error to transparent pixels
+                     # Don't distribute error to transparent pixels (those pre-filled or originally transparent)
                     if not (has_alpha and alpha_mask[ny, nx]):
-                         result[ny, nx] += error * err_weights_val[i]
+                         result[ny, nx, :3] += error_rgb * err_weights_val[i]
 
     # Clip values at the end
     # Numba doesn't directly support np.clip with min/max arrays easily across dimensions
-    # So we clip per channel
+    # So we clip per channel (channels is from original img_float)
     for i in range(channels):
         result[:, :, i] = np.maximum(0.0, np.minimum(255.0, result[:, :, i]))
 
@@ -374,18 +384,14 @@ class SmartImagePaletteConvert:
 
             # Determine the transparent color index from the palette
             transparent_idx = -1
-            if has_alpha:
-                # Find index where alpha is 0
-                alpha_channel = palette_float[:, 3]
-                transparent_indices = np.where(alpha_channel == 0.0)[0]
-                if len(transparent_indices) > 0:
-                    transparent_idx = transparent_indices[0] # Take the first one
-                # else: # Should not happen if generated correctly
-                #     print("Warning: No transparent color (alpha=0) found in palette for direct mapping.")
-                #     # Fallback: maybe use the one with modified RGB if that helps?
-                #     # Or just map to closest non-transparent? For now, let it map.
-
-
+            if has_alpha: # img has alpha
+                # Check if palette ALSO has alpha before trying to access its alpha channel
+                if palette_float.shape[1] == 4:
+                    alpha_channel = palette_float[:, 3]
+                    transparent_indices = np.where(alpha_channel == 0.0)[0]
+                    if len(transparent_indices) > 0:
+                        transparent_idx = transparent_indices[0] # Take the first one
+                # else: palette is RGB, so no transparent_idx to find in it.
             # Use palette RGB for distance calculation (will include -99999 if present)
             palette_rgb = palette_float[:, :3]
 
@@ -440,10 +446,12 @@ class SmartImagePaletteConvert:
         # Pre-calculate transparent index if needed
         transparent_idx = -1
         if has_alpha:
-             alpha_channel = palette_float[:, 3]
-             transparent_indices = np.where(alpha_channel == 0.0)[0]
-             if len(transparent_indices) > 0:
-                 transparent_idx = transparent_indices[0]
+             # Check if palette ALSO has alpha
+             if palette_float.shape[1] == 4:
+                 alpha_channel = palette_float[:, 3]
+                 transparent_indices = np.where(alpha_channel == 0.0)[0]
+                 if len(transparent_indices) > 0:
+                     transparent_idx = transparent_indices[0]
              # else: # Handle case where no transparent color found if necessary
              #     print("Warning: No transparent color (alpha=0) found in palette for dithering.")
 
@@ -1598,6 +1606,7 @@ class SmartSaveAnimatedPNG:
                 "filename_prefix": ("STRING", {"default": "ComfyUI"}),
                 # Keep lossy_quality for potential future use, but set default high
                 "lossless": ("BOOLEAN", {"default": True}),
+                "save_metadata": ("BOOLEAN", {"default": True}),
              },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1607,7 +1616,7 @@ class SmartSaveAnimatedPNG:
     OUTPUT_NODE = True
     CATEGORY = "SmartImageTools"
 
-    def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, prompt=None, extra_pnginfo=None):
+    def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, save_metadata=True, prompt=None, extra_pnginfo=None):
         full_output_folder, filename, counter, subfolder, filename_prefix_ = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         # Extract the base filename part from the potentially path-like filename_prefix_
         base_filename = os.path.basename(filename_prefix_)
@@ -1639,7 +1648,7 @@ class SmartSaveAnimatedPNG:
                     buffer = io.BytesIO()
                     # Determine PNG save options based on lossless flag
                     pnginfo = None
-                    if prompt is not None:
+                    if save_metadata and prompt is not None:
                         pnginfo = PngInfo()
                         if extra_pnginfo is not None:
                             for key in extra_pnginfo:
@@ -1724,6 +1733,65 @@ class SmartSavePNG:
         return (images,)
 
 
+class SmartDrawPoints:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "points": ("POINT_SET",),
+                "color": (list(BG_COLOR_MAP.keys()),),
+                "circle_size": ("INT", {"default": 5, "min": 1, "max": 100, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "draw_points"
+    CATEGORY = "SmartImageTools"
+
+    def draw_points(self, image, points, color, circle_size):
+        # Convert from tensor to numpy array
+        input_image = 255. * image.cpu().numpy()
+        batch_size = input_image.shape[0]
+        output_images = []
+
+        for i in range(batch_size):
+            img = input_image[i].copy()
+            h, w = img.shape[:2]
+            
+            # Convert image to uint8 for OpenCV
+            img_uint8 = img.astype(np.uint8)
+            
+            # Get color values
+            if color == "transparent":
+                # For transparent, use black with alpha=0
+                circle_color = (0, 0, 0, 0)
+            else:
+                # Get RGB values and add alpha=255
+                rgb = BG_COLOR_MAP[color]
+                circle_color = rgb + (255,)
+            
+            # Draw circles for each point
+            for point in points:
+                # Convert point from normalized (0-1) to pixel coordinates
+                x = int(point[0] * w)
+                y = int((1 - point[1]) * h)  # Invert y as OpenCV uses top-left origin
+                
+                # Clamp coordinates to valid range
+                x = max(0, min(x, w - 1))
+                y = max(0, min(y, h - 1))
+                
+                # Draw filled circle
+                cv2.circle(img_uint8, (x, y), circle_size, circle_color, -1)
+            
+            output_images.append(img_uint8)
+        
+        # Convert back to tensor
+        output_tensor = torch.from_numpy(np.stack(output_images) / 255.0).float()
+        
+        return (output_tensor,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
@@ -1740,7 +1808,8 @@ NODE_CLASS_MAPPINGS = {
     "SmartSemiTransparenceRemove": SmartSemiTransparenceRemove,
     "SmartVideoPreviewScaled": SmartVideoPreviewScaled,
     "SmartSaveAnimatedPNG": SmartSaveAnimatedPNG,
-    "SmartSavePNG": SmartSavePNG
+    "SmartSavePNG": SmartSavePNG,
+    "SmartDrawPoints": SmartDrawPoints
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1759,5 +1828,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartSemiTransparenceRemove": "Smart Semi-Transparence Remove",
     "SmartVideoPreviewScaled": "Smart Video Preview Scaled",
     "SmartSaveAnimatedPNG": "Smart Save Animated PNG",
-    "SmartSavePNG": "Smart Save PNG"
+    "SmartSavePNG": "Smart Save PNG",
+    "SmartDrawPoints": "Smart Draw Points"
 } 
