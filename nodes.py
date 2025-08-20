@@ -1607,6 +1607,7 @@ class SmartSaveAnimatedPNG:
                 # Keep lossy_quality for potential future use, but set default high
                 "lossless": ("BOOLEAN", {"default": True}),
                 "save_metadata": ("BOOLEAN", {"default": True}),
+                "format": (["APNG", "PNGif", "GIF"], {"default": "APNG"}),
              },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1615,14 +1616,255 @@ class SmartSaveAnimatedPNG:
     FUNCTION = "save_apng"
     OUTPUT_NODE = True
     CATEGORY = "SmartImageTools"
+    
+    def save_animated_gif(self, images, filename, fps, loop, optimize, quality, preserve_transparency, alpha_threshold):
+        try:
+            from PIL import Image
+            import numpy as np
+            import torch
+        except ImportError as e:
+            raise RuntimeError(f"Required libraries not available: {e}. Please install Pillow.")
 
-    def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, save_metadata=True, prompt=None, extra_pnginfo=None):
+        # Ensure filename has .gif extension
+        if not filename.lower().endswith('.gif'):
+            if filename.endswith('.'):
+                filename = filename + 'gif'
+            else:
+                filename = filename + '.gif'
+
+        # Convert relative path to absolute path within ComfyUI's output directory
+        output_dir = folder_paths.get_output_directory()
+        full_path = os.path.join(output_dir, filename)
+        
+        # Create directories if they don't exist
+        directory = os.path.dirname(full_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        
+        # Convert images to PIL format
+        pil_frames = []
+        has_transparent_pixel = False
+        used_colors = set()
+        alpha_thresh = alpha_threshold * 255
+
+        if isinstance(images, torch.Tensor) and images.dim() == 4:
+            # Handle batch of images
+            batch_size = images.shape[0]
+        else:
+            # If not a batch tensor, treat as list
+            batch_size = len(images)
+
+        for i in range(batch_size):
+            if isinstance(images, torch.Tensor):
+                img = images[i]
+            else:
+                img = images[i]
+
+            if isinstance(img, torch.Tensor):
+                img = img.detach().cpu()
+                if img.dim() == 3:
+                    if img.shape[0] in [1, 3, 4]:  # CHW
+                        img = img.permute(1, 2, 0)
+                if img.max() <= 1.0:
+                    img = img * 255
+                img = img.round().clamp(0, 255).byte().numpy()
+                mode = 'RGBA' if img.shape[-1] == 4 else 'RGB' if img.shape[-1] == 3 else 'L' if img.shape[-1] == 1 else None
+                if mode is None:
+                    raise ValueError(f"Unsupported tensor channel count: {img.shape[-1]}")
+                if mode == 'L':
+                    img = np.repeat(img[:, :, np.newaxis], 3, axis=-1)
+                    mode = 'RGB'
+                pil_img = Image.fromarray(img, mode)
+            elif isinstance(img, np.ndarray):
+                if img.max() <= 1.0:
+                    img = img * 255
+                img = np.round(img).clip(0, 255).astype(np.uint8)
+                mode = 'RGBA' if img.shape[-1] == 4 else 'RGB' if img.shape[-1] == 3 else 'L' if img.shape[-1] == 1 else None
+                if mode is None:
+                    raise ValueError(f"Unsupported array channel count: {img.shape[-1]}")
+                if mode == 'L':
+                    img = np.repeat(img[:, :, np.newaxis], 3, axis=-1)
+                    mode = 'RGB'
+                pil_img = Image.fromarray(img, mode)
+            elif isinstance(img, Image.Image):
+                pil_img = img
+            else:
+                raise ValueError(f"Unsupported image type: {type(img)}")
+
+            # Convert to RGBA for consistency if transparency might be present
+            if pil_img.mode not in ['RGB', 'RGBA']:
+                pil_img = pil_img.convert('RGB')
+
+            if preserve_transparency and pil_img.mode == 'RGBA':
+                data = np.array(pil_img)
+                alpha = data[:, :, 3]
+                if np.any(alpha < alpha_thresh):
+                    has_transparent_pixel = True
+                opaque_mask = alpha >= alpha_thresh
+                opaque_rgb = data[opaque_mask, :3]
+                for color in opaque_rgb:
+                    used_colors.add(tuple(map(int, color)))
+
+            pil_frames.append(pil_img)
+
+        if not pil_frames:
+            raise ValueError("No valid images provided")
+
+        if not preserve_transparency or not has_transparent_pixel:
+            # Composite to RGB with white background
+            for i in range(len(pil_frames)):
+                if pil_frames[i].mode == 'RGBA':
+                    background = Image.new('RGB', pil_frames[i].size, (255, 255, 255))
+                    background.paste(pil_frames[i], mask=pil_frames[i].getchannel('A'))
+                    pil_frames[i] = background
+            pil_images = pil_frames
+        else:
+            # Find global key_color not used in any opaque pixel
+            key_color = None
+            attempts = 0
+            while attempts < 10000 and key_color is None:
+                r = random.randint(0, 255)
+                g = random.randint(0, 255)
+                b = random.randint(0, 255)
+                if (r, g, b) not in used_colors:
+                    key_color = (r, g, b)
+                attempts += 1
+
+            if key_color is None:
+                key_color = (255, 0, 255)
+                # Replace occurrences of key_color in opaque areas
+                for i in range(len(pil_frames)):
+                    if pil_frames[i].mode == 'RGBA':
+                        data = np.array(pil_frames[i])
+                        alpha = data[:, :, 3]
+                        match = (data[:, :, 0] == 255) & (data[:, :, 1] == 0) & (data[:, :, 2] == 255) & (alpha >= alpha_thresh)
+                        data[match, 0] = 254
+                        pil_frames[i] = Image.fromarray(data, 'RGBA')
+
+            # Create RGB frames with key_color in transparent areas
+            rgb_frames = []
+            for frame in pil_frames:
+                if frame.mode == 'RGBA':
+                    data = np.array(frame)
+                    transparent_mask = data[:, :, 3] < alpha_thresh
+                    rgb_data = data[:, :, :3]
+                    rgb_data[transparent_mask] = key_color
+                    frame_rgb = Image.fromarray(rgb_data, 'RGB')
+                else:
+                    frame_rgb = frame.convert('RGB')
+                rgb_frames.append(frame_rgb)
+
+            # Create large image for global palette
+            widths, heights = zip(*(f.size for f in rgb_frames))
+            max_width = max(widths)
+            total_height = sum(heights) + 32  # Extra for key block
+            large_img = Image.new('RGB', (max_width, total_height))
+            y = 0
+            for f in rgb_frames:
+                large_img.paste(f, (0, y))
+                y += f.height
+            key_block = Image.new('RGB', (32, 32), key_color)
+            large_img.paste(key_block, (0, y))
+
+            # Quantize large image
+            large_quant = large_img.quantize(colors=256, method=Image.Quantize.MAXCOVERAGE)
+            global_palette = large_quant.getpalette()[:256*3]
+
+            # Find trans_index
+            trans_index = -1
+            for i in range(256):
+                if (global_palette[i*3] == key_color[0] and
+                    global_palette[i*3 + 1] == key_color[1] and
+                    global_palette[i*3 + 2] == key_color[2]):
+                    trans_index = i
+                    break
+
+            if trans_index == -1:
+                # Fallback to per-frame palettes
+                pil_images = []
+                for frame_rgb in rgb_frames:
+                    frame_p = frame_rgb.quantize(colors=256)
+                    palette = frame_p.getpalette()[:256*3]
+                    for j in range(256):
+                        if (palette[j*3] == key_color[0] and
+                            palette[j*3 + 1] == key_color[1] and
+                            palette[j*3 + 2] == key_color[2]):
+                            frame_p.info['transparency'] = j
+                            frame_p.info['disposal'] = 2
+                            break
+                        pil_images.append(frame_p)
+                    if pil_images:
+                        pil_images[0].info['background'] = pil_images[0].info.get('transparency', 0)
+            else:
+                # Use global palette
+                palette_img = Image.new('P', (1, 1))
+                palette_img.putpalette(global_palette)
+                pil_images = []
+                for frame_rgb in rgb_frames:
+                    frame_p = frame_rgb.quantize(palette=palette_img)
+                    frame_p.info['transparency'] = trans_index
+                    frame_p.info['disposal'] = 2
+                    pil_images.append(frame_p)
+                if pil_images:
+                    pil_images[0].info['background'] = trans_index
+
+        # Calculate duration per frame in milliseconds
+        duration = int(1000 / fps)
+        
+        # Save as animated GIF
+        pil_images[0].save(
+            full_path,
+            save_all=True,
+            append_images=pil_images[1:],
+            duration=duration,
+            loop=loop,
+            optimize=optimize,
+            quality=quality
+        )
+        
+        return (full_path,)	
+
+    def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, save_metadata=True, format="APNG", prompt=None, extra_pnginfo=None):
         full_output_folder, filename, counter, subfolder, filename_prefix_ = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         # Extract the base filename part from the potentially path-like filename_prefix_
         base_filename = os.path.basename(filename_prefix_)
         # Use a single filename, not numbered sequence
-        file = f"{base_filename}.apng" # Use the extracted base name
+        if format == "APNG":
+            ext = "apng"
+        elif format == "PNGif":
+            ext = "pngif"
+        else:
+            ext = "gif"
+        file = f"{base_filename}.{ext}" # Use the extracted base name
         file_path = os.path.join(full_output_folder, file)
+
+        # GIF branch: delegate to save_animated_gif
+        if format == "GIF":
+            results = list()
+            try:
+                relative_filename = os.path.join(subfolder, file) if subfolder else file
+                self.save_animated_gif(
+                    images=images,
+                    filename=relative_filename,
+                    fps=fps,
+                    loop=0,
+                    optimize=True,
+                    quality=95,
+                    preserve_transparency=True,
+                    alpha_threshold=0.01,
+                )
+
+                results.append({
+                    "filename": file,
+                    "subfolder": subfolder,
+                    "type": self.type
+                })
+
+            except Exception as e:
+                print(f"Error saving GIF file: {e}")
+                raise
+
+            return {"ui": {"apng": results}}
 
         num_frames = images.shape[0]
         fps_int = int(round(fps * 100)) # Multiply by 100 and convert to int
@@ -1827,7 +2069,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartImagePaletteExtract": "Smart Image Palette Extract",
     "SmartSemiTransparenceRemove": "Smart Semi-Transparence Remove",
     "SmartVideoPreviewScaled": "Smart Video Preview Scaled",
-    "SmartSaveAnimatedPNG": "Smart Save Animated PNG",
+    "SmartSaveAnimatedPNG": "Smart Save Animated Image",
     "SmartSavePNG": "Smart Save PNG",
     "SmartDrawPoints": "Smart Draw Points"
 } 
