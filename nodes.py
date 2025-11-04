@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageSequence, ImageOps
 from PIL.PngImagePlugin import PngInfo # Added import
 from sklearn.cluster import KMeans
 from skimage import color
@@ -19,6 +19,8 @@ import colorsys
 import json
 import math # Added for ceil/floor
 import struct
+import hashlib
+import node_helpers
 
 # Numba optimized functions
 @numba.jit(nopython=True)
@@ -167,6 +169,7 @@ class SmartImagePaletteConvert:
             },
             "optional": {
                 "reference_image": ("IMAGE",),
+                "additional_colors": ("IMAGE",),
             }
         }
 
@@ -271,7 +274,7 @@ class SmartImagePaletteConvert:
             palette[:len(unique_colors_float), :3] = unique_colors_float
             palette[:len(unique_colors_float), 3] = 255.0  # Full opacity
             # Use large negative RGB for transparent color temporarily (this is needed to cancel the transparent color from picking it while searching for the closest color)
-            palette[-1] = [-99999.0, -99999.0, -99999.0, 0.0]
+            palette[-1] = [-500.0, -500.0, -500.0, 0.0]
         else:
             # No alpha channel, just get unique RGB colors
             unique_colors = np.unique(img_flat, axis=0)
@@ -282,6 +285,71 @@ class SmartImagePaletteConvert:
         sorted_palette_float = self._sort_palette(palette)
         # Return as uint8 after sorting and potential modification
         return np.clip(sorted_palette_float, 0, 255).astype(np.uint8)
+
+    def merge_palettes(self, palette1, palette2):
+        """Merge two palettes while avoiding duplicates."""
+        # Ensure both palettes are float32 for processing
+        palette1_float = palette1.astype(np.float32)
+        palette2_float = palette2.astype(np.float32)
+
+        # Determine if we need to handle alpha channels
+        has_alpha1 = palette1_float.shape[1] == 4
+        has_alpha2 = palette2_float.shape[1] == 4
+
+        if has_alpha1 and has_alpha2:
+            # Both have alpha - merge properly
+            # Combine all colors
+            combined = np.vstack([palette1_float, palette2_float])
+
+            # Find unique colors based on RGB values (ignore alpha for uniqueness)
+            rgb_colors = combined[:, :3]
+
+            # Create a set to track unique RGB combinations
+            unique_indices = []
+            seen_rgb = set()
+
+            for i, rgb in enumerate(rgb_colors):
+                rgb_tuple = tuple(rgb)
+                if rgb_tuple not in seen_rgb:
+                    seen_rgb.add(rgb_tuple)
+                    unique_indices.append(i)
+
+            # Extract unique colors
+            unique_palette = combined[unique_indices]
+
+        elif has_alpha1 or has_alpha2:
+            # One has alpha, the other doesn't - convert both to RGBA
+            if not has_alpha1:
+                # Add alpha channel to palette1
+                alpha_col = np.full((palette1_float.shape[0], 1), 255.0, dtype=np.float32)
+                palette1_float = np.hstack([palette1_float, alpha_col])
+
+            if not has_alpha2:
+                # Add alpha channel to palette2
+                alpha_col = np.full((palette2_float.shape[0], 1), 255.0, dtype=np.float32)
+                palette2_float = np.hstack([palette2_float, alpha_col])
+
+            # Now both have alpha, use the same logic as above
+            combined = np.vstack([palette1_float, palette2_float])
+            rgb_colors = combined[:, :3]
+
+            unique_indices = []
+            seen_rgb = set()
+
+            for i, rgb in enumerate(rgb_colors):
+                rgb_tuple = tuple(rgb)
+                if rgb_tuple not in seen_rgb:
+                    seen_rgb.add(rgb_tuple)
+                    unique_indices.append(i)
+
+            unique_palette = combined[unique_indices]
+
+        else:
+            # Neither has alpha - simple RGB merging
+            combined = np.vstack([palette1_float, palette2_float])
+            unique_palette = np.unique(combined, axis=0)
+
+        return unique_palette
 
     def generate_palette(self, img, num_colors, has_transparency=True):
         """Generate an optimal color palette using K-means clustering in CIELAB space."""
@@ -473,7 +541,7 @@ class SmartImagePaletteConvert:
         # Palette is expected to be float32 here
         return self.apply_floyd_steinberg_dithering(image, palette, dithering_amount)
 
-    def convert_image(self, image, num_colors, dithering_amount, reference_image=None):
+    def convert_image(self, image, num_colors, dithering_amount, reference_image=None, additional_colors=None):
         # Convert from tensor to numpy array
         input_image = 255. * image.cpu().numpy()
 
@@ -491,11 +559,28 @@ class SmartImagePaletteConvert:
                 transparent_indices = np.where(alpha_channel == 0.0)[0]
                 if len(transparent_indices) > 0:
                     palette_float[transparent_indices, :3] = -99999.0
-
         else:
             # Generate optimal palette from the input image using num_colors
             # Returns float32 palette with modified transparent color already
             palette_float = self.generate_palette(input_image[0], num_colors)
+
+        # Process additional colors if provided
+        if additional_colors is not None:
+            additional_np = 255. * additional_colors.cpu().numpy()
+            # Extract exact palette from additional colors image
+            additional_palette_uint8 = self.extract_palette_from_reference(additional_np[0])
+            # Convert to float32 for processing
+            additional_palette_float = additional_palette_uint8.astype(np.float32)
+
+            # Ensure transparent color has modified RGB if present in additional palette
+            if additional_palette_float.shape[1] == 4:
+                alpha_channel = additional_palette_float[:, 3]
+                transparent_indices = np.where(alpha_channel == 0.0)[0]
+                if len(transparent_indices) > 0:
+                    additional_palette_float[transparent_indices, :3] = -99999.0
+
+            # Merge the palettes while avoiding duplicates
+            palette_float = self.merge_palettes(palette_float, additional_palette_float)
 
 
         # Create output array with same batch size as input
@@ -645,7 +730,7 @@ class SmartGenerateImage:
         return {
             "required": {
                 "color": (["red", "green", "blue", "black", "white", "yellow", "cyan", "magenta",
-                           "gray", "orange", "purple", "brown", "pink", "transparent"],),
+                           "gray", "dark gray", "orange", "purple", "brown", "pink", "transparent"],),
                 "alpha": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "use_alpha": ("BOOLEAN", {"default": True}),
             },
@@ -672,6 +757,7 @@ class SmartGenerateImage:
             "cyan": [0, 255, 255],
             "magenta": [255, 0, 255],
             "gray": [128, 128, 128],
+            "dark gray": [64, 64, 64],
             "orange": [255, 165, 0],
             "purple": [128, 0, 128],
             "brown": [165, 42, 42],
@@ -982,6 +1068,7 @@ class SmartImagePreviewScaled(PreviewImage):
                 "images": ("IMAGE",),
                 # Change to FLOAT widget
                 "scale_by": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.1}),
+                "transparency": (["original", "black", "white", "orange"], {"default": "original"}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -992,10 +1079,18 @@ class SmartImagePreviewScaled(PreviewImage):
     CATEGORY = "SmartImageTools"
 
     # Use execute to potentially modify images before calling the parent's save logic
-    def execute(self, images, scale_by=1.0, filename_prefix="SmartScaledPreview", prompt=None, extra_pnginfo=None):
+    def execute(self, images, scale_by=1.0, transparency="original", filename_prefix="SmartScaledPreview", prompt=None, extra_pnginfo=None):
+        # Store original dimensions before any scaling
+        original_height = images.shape[1]
+        original_width = images.shape[2]
+        
         if abs(scale_by - 1.0) < 1e-6 or scale_by <= 0:
             # No scaling or invalid scale factor, use original save_images
-            return self.save_images(images, filename_prefix, prompt, extra_pnginfo)
+            result = self.save_images(images, filename_prefix, prompt, extra_pnginfo)
+            # Add original dimensions to the result
+            if "ui" in result:
+                result["ui"]["original_dimensions"] = [[original_width, original_height]]
+            return result
 
         # Perform scaling
         scaled_images_list = []
@@ -1020,6 +1115,29 @@ class SmartImagePreviewScaled(PreviewImage):
             else:
                 # Resize using nearest neighbor
                 resized_img = cv2.resize(img_np_uint8, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+            # --- Transparency Blending ---
+            if transparency != "original":
+                # Convert to PIL for alpha compositing
+                resized_pil = Image.fromarray(resized_img)
+
+                # Ensure image is RGBA for compositing
+                if resized_pil.mode != 'RGBA':
+                    resized_pil = resized_pil.convert('RGBA')
+
+                # Get background color from BG_COLOR_MAP
+                if transparency in BG_COLOR_MAP and BG_COLOR_MAP[transparency] is not None:
+                    blend_rgb = BG_COLOR_MAP[transparency]
+                    # Create a background image of the solid color
+                    background = Image.new('RGBA', resized_pil.size, blend_rgb + (255,))
+
+                    # Composite the original image over the background
+                    # This automatically handles the alpha blending
+                    resized_pil = Image.alpha_composite(background, resized_pil)
+
+                # Convert back to numpy array
+                resized_img = np.array(resized_pil)
+            # --- End Transparency Blending ---
 
             # Handle potential shape issues after resize (e.g., grayscale losing channel dim)
             if len(resized_img.shape) == 2 and len(img_np_uint8.shape) == 3:
@@ -1049,7 +1167,11 @@ class SmartImagePreviewScaled(PreviewImage):
         scaled_images_batch = torch.stack(scaled_images_list)
 
         # Call the parent's save_images method with the scaled images
-        return self.save_images(scaled_images_batch, filename_prefix, prompt, extra_pnginfo)
+        result = self.save_images(scaled_images_batch, filename_prefix, prompt, extra_pnginfo)
+        # Add original dimensions to the result
+        if "ui" in result:
+            result["ui"]["original_dimensions"] = [[original_width, original_height]]
+        return result
 
 
 class SmartPreviewPalette:
@@ -1395,6 +1517,7 @@ class SmartSemiTransparenceRemove:
         "cyan": [0.0, 1.0, 1.0],
         "magenta": [1.0, 0.0, 1.0],
         "gray": [0.5, 0.5, 0.5],
+        "dark gray": [0.25, 0.25, 0.25],
         "orange": [1.0, 0.647, 0.0],
         "purple": [0.5, 0.0, 0.5],
         "brown": [0.647, 0.165, 0.165],
@@ -1518,6 +1641,7 @@ BG_COLOR_MAP = {
     "cyan": (0, 255, 255),
     "magenta": (255, 0, 255),
     "gray": (128, 128, 128),
+    "dark gray": (64, 64, 64),
     "orange": (255, 165, 0),
     "purple": (128, 0, 128),
     "brown": (165, 42, 42),
@@ -1545,32 +1669,44 @@ class SmartVideoPreviewScaled:
     def preview_video(self, images, fps, scale_by=2.0, bg_color="transparent", prompt=None, extra_pnginfo=None):
         # Convert tensors to PIL images and prepare for web UI
         image_data = []
+        original_dimensions = []
+        scaled_dimensions = []
+
         for image_tensor in images:
             img_np = image_tensor.cpu().numpy()
             # Handle potential non-standard ranges by clipping before conversion
             img_np = np.clip(img_np, 0.0, 1.0)
             img_pil = Image.fromarray((img_np * 255.0).astype(np.uint8))
 
+            # Store original dimensions
+            orig_w, orig_h = img_pil.size
+            original_dimensions.append([orig_w, orig_h])
+
             # --- Scaling happens here ---
             if abs(scale_by - 1.0) > 1e-6 and scale_by > 0:
-                w, h = img_pil.size
-                new_w = max(1, int(round(w * scale_by)))
-                new_h = max(1, int(round(h * scale_by)))
+                new_w = max(1, int(round(orig_w * scale_by)))
+                new_h = max(1, int(round(orig_h * scale_by)))
                 # Resize using NEAREST neighbor
                 img_pil = img_pil.resize((new_w, new_h), Image.NEAREST)
+            else:
+                # If no scaling, scaled dimensions are same as original
+                new_w, new_h = orig_w, orig_h
             # --- End Scaling ---
 
-            # --- Background Blending --- 
+            # Store scaled dimensions
+            scaled_dimensions.append([new_w, new_h])
+
+            # --- Background Blending ---
             if bg_color != "transparent" and bg_color in BG_COLOR_MAP:
                 blend_rgb = BG_COLOR_MAP[bg_color]
                 if blend_rgb is not None:
                     # Ensure image is RGBA for compositing
                     if img_pil.mode != 'RGBA':
                         img_pil = img_pil.convert('RGBA')
-                    
+
                     # Create a background image of the solid color
                     background = Image.new('RGBA', img_pil.size, blend_rgb + (255,))
-                    
+
                     # Composite the original image over the background
                     # This automatically handles the alpha blending
                     img_pil = Image.alpha_composite(background, img_pil)
@@ -1587,9 +1723,14 @@ class SmartVideoPreviewScaled:
                 "type": "temp"
             })
 
-        # Only send images and fps
+        # Return images, fps, and both original and scaled dimensions
         # Use a unique key 'video_frames' to avoid conflicts with default preview handlers
-        return {"ui": {"video_frames": image_data, "fps": [fps]}}
+        return {"ui": {
+            "video_frames": image_data,
+            "fps": [fps],
+            "original_dimensions": original_dimensions,
+            "scaled_dimensions": scaled_dimensions
+        }}
 
 
 class SmartSaveAnimatedPNG:
@@ -2034,6 +2175,497 @@ class SmartDrawPoints:
         return (output_tensor,)
 
 
+class SmartLoadGIFImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        files = folder_paths.filter_files_content_types(files, ["image", "animated"])
+        return {"required":
+                    {"image": (sorted(files), {"image_upload": True}),
+                     "custom_frame": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1})},
+                }
+
+    CATEGORY = "SmartImageTools"
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "IMAGE", "MASK", "IMAGE", "MASK")
+    RETURN_NAMES = ("all_images", "all_masks", "first_frame", "first_mask", "last_frame", "last_mask", "custom_frame", "custom_mask")
+    FUNCTION = "load_gif_image"
+
+    def load_gif_image(self, image, custom_frame):
+        image_path = folder_paths.get_annotated_filepath(image)
+
+        img = node_helpers.pillow(Image.open, image_path)
+
+        output_images = []
+        output_masks = []
+        w, h = None, None
+
+        excluded_formats = ['MPO']
+
+        for i in ImageSequence.Iterator(img):
+            i = node_helpers.pillow(ImageOps.exif_transpose, i)
+
+            if i.mode == 'I':
+                i = i.point(lambda i: i * (1 / 255))
+
+            if len(output_images) == 0:
+                w = i.size[0]
+                h = i.size[1]
+
+            if i.size[0] != w or i.size[1] != h:
+                continue
+
+            # Handle transparency properly - output RGBA when transparency exists
+            if 'A' in i.getbands():
+                # Image has alpha channel - use RGBA directly
+                rgba_image = i.convert("RGBA")
+                alpha = np.array(rgba_image.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(alpha)
+                # Output RGBA image to preserve transparency
+                image = np.array(rgba_image).astype(np.float32) / 255.0
+                image = torch.from_numpy(image)[None,]
+            elif i.mode == 'P' and 'transparency' in i.info:
+                # Palette image with transparency - use RGBA
+                rgba_image = i.convert('RGBA')
+                alpha = np.array(rgba_image.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(alpha)
+                # Output RGBA image to preserve transparency
+                image = np.array(rgba_image).astype(np.float32) / 255.0
+                image = torch.from_numpy(image)[None,]
+            else:
+                # No transparency - output RGB with zero mask
+                mask = torch.zeros((h, w), dtype=torch.float32, device="cpu")
+                rgb_image = i.convert("RGB")
+                image = np.array(rgb_image).astype(np.float32) / 255.0
+                image = torch.from_numpy(image)[None,]
+
+            output_images.append(image)
+            output_masks.append(mask.unsqueeze(0))
+
+        if len(output_images) == 0:
+            raise ValueError("No valid frames found in the image")
+
+        # All images concatenated (like original LoadImage behavior)
+        if len(output_images) > 1 and img.format not in excluded_formats:
+            all_images = torch.cat(output_images, dim=0)
+            all_masks = torch.cat(output_masks, dim=0)
+        else:
+            all_images = output_images[0]
+            all_masks = output_masks[0]
+
+        # First frame and mask
+        first_frame = output_images[0]
+        first_mask = output_masks[0]
+
+        # Last frame and mask
+        last_frame = output_images[-1]
+        last_mask = output_masks[-1]
+
+        # Custom frame and mask
+        if custom_frame < len(output_images):
+            custom_frame_img = output_images[custom_frame]
+            custom_frame_mask = output_masks[custom_frame]
+        else:
+            # If custom_frame is out of range, default to last frame
+            custom_frame_img = output_images[-1]
+            custom_frame_mask = output_masks[-1]
+
+        return (all_images, all_masks, first_frame, first_mask, last_frame, last_mask, custom_frame_img, custom_frame_mask)
+
+    @classmethod
+    def IS_CHANGED(s, image, custom_frame):
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        m.update(str(custom_frame).encode())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image, custom_frame):
+        if not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+
+        return True
+
+
+class SmartImagePaletteCreate:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "colors": ("INT", {"default": 5, "min": 1, "max": 5, "step": 1}),
+                "color_1": ("COLOR", {"default": "#000000"}),  # Black
+                "color_2": ("COLOR", {"default": "#000000"}),  # Black
+                "color_3": ("COLOR", {"default": "#000000"}),  # Black
+                "color_4": ("COLOR", {"default": "#000000"}),  # Black
+                "color_5": ("COLOR", {"default": "#000000"}),  # Black
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("palette_image",)
+    FUNCTION = "create_palette"
+    CATEGORY = "SmartImageTools"
+
+    def hex_to_rgb(self, hex_color):
+        """Convert hex color string to RGB tuple."""
+        hex_color = hex_color.lstrip('#')
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+    def create_palette(self, colors, color_1, color_2, color_3, color_4, color_5):
+        """Create a palette image with specified colors."""
+        # Collect all color inputs
+        color_inputs = [color_1, color_2, color_3, color_4, color_5]
+
+        # Take only the number of colors specified
+        selected_colors = color_inputs[:colors]
+
+        # Convert hex colors to RGB
+        rgb_colors = []
+        for hex_color in selected_colors:
+            rgb = self.hex_to_rgb(hex_color)
+            rgb_colors.append(rgb)
+
+        # Create palette image: 1 pixel height, colors pixels width
+        height = 1
+        width = len(rgb_colors)
+
+        # Create numpy array for the image
+        palette_img = np.zeros((height, width, 3), dtype=np.uint8)
+
+        # Fill each pixel with the corresponding color
+        for i, rgb in enumerate(rgb_colors):
+            palette_img[0, i] = rgb
+
+        # Convert to torch tensor and add batch dimension
+        palette_tensor = torch.from_numpy(palette_img).float() / 255.0
+        palette_tensor = palette_tensor.unsqueeze(0)  # Add batch dimension
+
+        return (palette_tensor,)
+
+
+class SmartBackgroundFill:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "background_color": (list(BG_COLOR_MAP.keys()), {"default": "white"}),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "fill_background"
+    CATEGORY = "SmartImageTools"
+
+    def fill_background(self, image, background_color, mask=None):
+        # Convert from tensor to numpy array
+        input_image = 255. * image.cpu().numpy()
+        batch_size = input_image.shape[0]
+        output_images = []
+
+        # Get background color RGB values (0-255 range)
+        if background_color == "transparent":
+            # For transparent, use black with alpha=0, but since we're filling background,
+            # this doesn't make sense - default to white
+            bg_rgb = (255, 255, 255)
+        else:
+            bg_rgb = BG_COLOR_MAP[background_color]
+            if bg_rgb is None:
+                # Fallback to white if color is not found
+                bg_rgb = (255, 255, 255)
+
+        for i in range(batch_size):
+            img = input_image[i].copy()
+            channels = img.shape[2] if len(img.shape) > 2 else 0
+
+            if channels == 3:
+                # RGB image - pass through without modification
+                output_images.append(img)
+            elif channels == 4:
+                # RGBA image - process transparency and output RGB
+                h, w = img.shape[:2]
+
+                # Get alpha channel - either from image or from mask
+                if mask is not None:
+                    # Use mask's alpha values
+                    # Mask: 0.0 = keep original (opaque), 1.0 = fill background (transparent)
+                    # Convert to alpha: 0.0 = transparent, 1.0 = opaque
+                    mask_np = mask[i].cpu().numpy()
+                    alpha = 1.0 - mask_np  # Invert mask values for proper alpha interpretation
+                else:
+                    # Use image's alpha channel (0.0 = transparent, 1.0 = opaque)
+                    alpha = img[:, :, 3] / 255.0
+
+                # Create RGB result image (always 3 channels)
+                result = np.zeros((h, w, 3), dtype=np.uint8)
+
+                # For fully transparent pixels (alpha = 0), set to background color
+                transparent_mask = alpha == 0.0
+                result[transparent_mask] = bg_rgb
+
+                # For semi-transparent pixels, blend with background color
+                semi_transparent_mask = (alpha > 0.0) & (alpha < 1.0)
+
+                if semi_transparent_mask.any():
+                    # Blend: result = (original * alpha) + (background * (1 - alpha))
+                    original_rgb = img[semi_transparent_mask, :3]
+                    alpha_values = alpha[semi_transparent_mask]
+
+                    # Expand alpha and bg_rgb for broadcasting
+                    alpha_expanded = alpha_values[:, np.newaxis]  # Shape: [num_pixels, 1]
+                    bg_rgb_expanded = np.array(bg_rgb)[np.newaxis, :]  # Shape: [1, 3]
+
+                    # Perform blending
+                    blended_rgb = original_rgb * alpha_expanded + bg_rgb_expanded * (1.0 - alpha_expanded)
+
+                    # Set blended RGB values back
+                    result[semi_transparent_mask] = blended_rgb.astype(np.uint8)
+
+                # For fully opaque pixels, copy original RGB
+                opaque_mask = alpha == 1.0
+                result[opaque_mask] = img[opaque_mask, :3]
+
+                output_images.append(result)
+            else:
+                # Unexpected number of channels - pass through
+                output_images.append(img)
+
+        # Convert back to tensor
+        output_tensor = torch.from_numpy(np.stack(output_images) / 255.0).float()
+
+        return (output_tensor,)
+
+
+class SmartGetMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "get_mask"
+    CATEGORY = "SmartImageTools"
+
+    def get_mask(self, image):
+        # Convert from tensor to numpy array
+        input_image = image.cpu().numpy()
+        batch_size = input_image.shape[0]
+        output_masks = []
+
+        for i in range(batch_size):
+            img = input_image[i]
+            channels = img.shape[2] if len(img.shape) > 2 else 0
+
+            if channels == 3:
+                # RGB image - create pure white mask (all 1.0) representing opaque areas
+                h, w = img.shape[:2]
+                mask = np.ones((h, w), dtype=np.float32)
+                output_masks.append(mask)
+            elif channels == 4:
+                # RGBA image - extract and invert alpha channel as mask
+                # Alpha channel is 0.0 (transparent) to 1.0 (opaque)
+                # Invert so transparent areas (0.0) become white (1.0) in mask
+                # And opaque areas (1.0) become black (0.0) in mask
+                alpha = img[:, :, 3]  # Alpha channel
+                mask = 1.0 - alpha    # Invert the mask
+                output_masks.append(mask)
+            else:
+                # Unexpected number of channels - create white mask as fallback
+                h, w = img.shape[:2] if len(img.shape) >= 2 else (64, 64)  # Default size if unknown
+                mask = np.ones((h, w), dtype=np.float32)
+                output_masks.append(mask)
+
+        # Convert to tensor with batch dimension [batch, height, width]
+        output_tensor = torch.from_numpy(np.stack(output_masks))
+
+        return (output_tensor,)
+
+
+class SmartImagePadding:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "left": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "right": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "top": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "bottom": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
+                "fill": (["Transparent", "Black", "White", "Grey", "Stretch"], {"default": "Transparent"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "add_padding"
+    CATEGORY = "SmartImageTools"
+
+    def add_padding(self, image, left, right, top, bottom, fill):
+        # Convert from tensor to numpy array
+        input_image = 255. * image.cpu().numpy()
+        batch_size = input_image.shape[0]
+        output_images = []
+
+        for i in range(batch_size):
+            img = input_image[i].copy()
+            h, w = img.shape[:2]
+            channels = img.shape[2] if len(img.shape) > 2 else 0
+
+            # Convert RGB to RGBA if needed
+            if channels == 3:
+                # Add alpha channel - fully opaque
+                alpha_channel = np.full((h, w, 1), 255, dtype=np.uint8)
+                img = np.concatenate([img, alpha_channel], axis=2)
+            elif channels != 4:
+                # Handle unexpected channel count - create RGBA with opaque alpha
+                rgba_img = np.zeros((h, w, 4), dtype=np.uint8)
+                if channels >= 3:
+                    rgba_img[:, :, :3] = img[:, :, :3]
+                else:
+                    # Grayscale or other - replicate to RGB
+                    rgba_img[:, :, :3] = img[:, :, 0] if channels >= 1 else 255
+                rgba_img[:, :, 3] = 255  # Fully opaque
+                img = rgba_img
+
+            # Calculate new dimensions
+            new_h = h + top + bottom
+            new_w = w + left + right
+
+            # Create new image with appropriate fill
+            if fill == "Transparent":
+                padded_img = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+            elif fill == "Black":
+                padded_img = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+                padded_img[:, :, 3] = 255  # Fully opaque alpha
+            elif fill == "White":
+                padded_img = np.full((new_h, new_w, 4), 255, dtype=np.uint8)
+            elif fill == "Grey":
+                padded_img = np.full((new_h, new_w, 4), 128, dtype=np.uint8)
+                padded_img[:, :, 3] = 255  # Fully opaque alpha
+            elif fill == "Stretch":
+                padded_img = np.zeros((new_h, new_w, 4), dtype=np.uint8)
+                # Fill with stretched edge pixels
+                # Top padding
+                if top > 0:
+                    for y in range(top):
+                        padded_img[y, left:left + w] = img[0, :]
+                # Bottom padding
+                if bottom > 0:
+                    for y in range(top + h, new_h):
+                        padded_img[y, left:left + w] = img[h - 1, :]
+                # Left padding
+                if left > 0:
+                    for x in range(left):
+                        padded_img[top:top + h, x] = img[:, 0]
+                # Right padding
+                if right > 0:
+                    for x in range(left + w, new_w):
+                        padded_img[top:top + h, x] = img[:, w - 1]
+                # Fill corners
+                if top > 0 and left > 0:
+                    padded_img[:top, :left] = img[0, 0]
+                if top > 0 and right > 0:
+                    padded_img[:top, left + w:] = img[0, w - 1]
+                if bottom > 0 and left > 0:
+                    padded_img[top + h:, :left] = img[h - 1, 0]
+                if bottom > 0 and right > 0:
+                    padded_img[top + h:, left + w:] = img[h - 1, w - 1]
+
+            # Copy original image to the center (accounting for padding)
+            padded_img[top:top + h, left:left + w] = img
+
+            output_images.append(padded_img)
+
+        # Convert back to tensor
+        output_tensor = torch.from_numpy(np.stack(output_images) / 255.0).float()
+
+        return (output_tensor,)
+
+
+class SmartGradientDeformation:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "type": (["vertical", "horizontal"],),
+                "start_pos": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "end_pos": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "offset": ("INT", {"default": 20, "min": -8192, "max": 8192, "step": 1}),
+                "exponent": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("image", "gradient")
+    FUNCTION = "deform"
+    CATEGORY = "SmartImageTools"
+
+    def deform(self, image, type, start_pos, end_pos, offset, exponent):
+        if start_pos > end_pos:
+            start_pos, end_pos = end_pos, start_pos
+
+        batch_size, height, width, _ = image.shape
+        
+        deformed_images = []
+        gradient_images = []
+
+        for i in range(batch_size):
+            img_tensor = image[i]
+            img_np = img_tensor.cpu().numpy()
+
+            if type == "vertical":
+                size = height
+            else:
+                size = width
+            
+            start = int(start_pos * size)
+            end = int(end_pos * size)
+
+            grad_1d = np.zeros((size,), dtype=np.float32)
+
+            if start < end:
+                ramp = np.linspace(0, 1, num=end - start, dtype=np.float32)
+                grad_1d[start:end] = offset * (ramp ** exponent)
+            
+            if end < size:
+                grad_1d[end:] = offset
+
+            map_x, map_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+
+            if type == "vertical":
+                displacement = grad_1d.reshape(-1, 1)
+                map_y = map_y - displacement
+                gradient_map = np.tile(displacement, (1, width))
+            else:
+                map_x = map_x - grad_1d
+                gradient_map = np.tile(grad_1d, (height, 1))
+
+            deformed_img_np = cv2.remap(img_np, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            
+            min_val, max_val = np.min(gradient_map), np.max(gradient_map)
+            if max_val == min_val:
+                 gradient_map_norm = np.zeros_like(gradient_map, dtype=np.float32)
+            else:
+                 gradient_map_norm = (gradient_map - min_val) / (max_val - min_val)
+            
+            gradient_img_np = np.stack([gradient_map_norm] * 3, axis=-1)
+            
+            deformed_images.append(torch.from_numpy(deformed_img_np))
+            gradient_images.append(torch.from_numpy(gradient_img_np.astype(np.float32)))
+
+        deformed_batch = torch.stack(deformed_images)
+        gradient_batch = torch.stack(gradient_images)
+
+        return (deformed_batch, gradient_batch)
+
 NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
@@ -2051,7 +2683,13 @@ NODE_CLASS_MAPPINGS = {
     "SmartVideoPreviewScaled": SmartVideoPreviewScaled,
     "SmartSaveAnimatedPNG": SmartSaveAnimatedPNG,
     "SmartSavePNG": SmartSavePNG,
-    "SmartDrawPoints": SmartDrawPoints
+    "SmartDrawPoints": SmartDrawPoints,
+    "SmartLoadGIFImage": SmartLoadGIFImage,
+    "SmartImagePaletteCreate": SmartImagePaletteCreate,
+    "SmartBackgroundFill": SmartBackgroundFill,
+    "SmartGetMask": SmartGetMask,
+    "SmartImagePadding": SmartImagePadding,
+    "SmartGradientDeformation": SmartGradientDeformation
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2071,5 +2709,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartVideoPreviewScaled": "Smart Video Preview Scaled",
     "SmartSaveAnimatedPNG": "Smart Save Animated Image",
     "SmartSavePNG": "Smart Save PNG",
-    "SmartDrawPoints": "Smart Draw Points"
+    "SmartDrawPoints": "Smart Draw Points",
+    "SmartLoadGIFImage": "Smart Load GIF Image",
+    "SmartImagePaletteCreate": "Smart Image Palette Create",
+    "SmartBackgroundFill": "Smart Background Fill",
+    "SmartGetMask": "Smart Get Mask",
+    "SmartImagePadding": "Smart Image Padding",
+    "SmartGradientDeformation": "Smart Gradient Deformation"
 } 
