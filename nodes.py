@@ -1666,6 +1666,19 @@ class SmartVideoPreviewScaled:
     OUTPUT_NODE = True
     CATEGORY = "SmartNodes/Image"
 
+    @classmethod
+    def IS_CHANGED(s, images, fps, scale_by, bg_color, prompt=None, extra_pnginfo=None):
+        # Include all parameters that affect the output to prevent incorrect caching
+        # Create a hash of the parameters to ensure unique cache keys
+        m = hashlib.sha256()
+        m.update(str(fps).encode())
+        m.update(str(scale_by).encode())
+        m.update(str(bg_color).encode())
+        # Add a random component to force re-execution for preview nodes
+        # This ensures that even with identical parameters, preview updates properly
+        m.update(str(random.random()).encode())
+        return m.digest().hex()
+
     def preview_video(self, images, fps, scale_by=2.0, bg_color="transparent", prompt=None, extra_pnginfo=None):
         # Convert tensors to PIL images and prepare for web UI
         image_data = []
@@ -1731,6 +1744,165 @@ class SmartVideoPreviewScaled:
             "original_dimensions": original_dimensions,
             "scaled_dimensions": scaled_dimensions
         }}
+
+
+class SmartVideoPreviewScaledMasked:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "fps": ("FLOAT", {"default": 12.0, "min": 0.1, "max": 60.0, "step": 1}),
+                "scale_by": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "mask_color": ("STRING", {"default": "#FF0000FF"}),  # RGBA color as hex
+            },
+            "optional": {
+                "mask": ("MASK",),
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("composed_image",)
+    FUNCTION = "preview_video"
+    OUTPUT_NODE = True
+    CATEGORY = "SmartNodes/Image"
+
+    @classmethod
+    def IS_CHANGED(s, images, fps, scale_by, mask_color, mask=None, prompt=None, extra_pnginfo=None):
+        # Include all parameters to prevent incorrect caching
+        m = hashlib.sha256()
+        m.update(str(fps).encode())
+        m.update(str(scale_by).encode())
+        m.update(str(mask_color).encode())
+        # Add random component for preview nodes
+        m.update(str(random.random()).encode())
+        return m.digest().hex()
+
+    def hex_to_rgba(self, hex_color):
+        """Convert hex color string to RGBA tuple (0-255 range)."""
+        hex_color = hex_color.lstrip('#')
+        if len(hex_color) == 6:
+            # RGB only, add full opacity
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            a = 255
+        elif len(hex_color) == 8:
+            # RGBA
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            a = int(hex_color[6:8], 16)
+        else:
+            # Default to red if invalid
+            r, g, b, a = 255, 0, 0, 255
+        return (r, g, b, a)
+
+    def preview_video(self, images, fps, scale_by=2.0, mask_color="#FF0000FF", mask=None, prompt=None, extra_pnginfo=None):
+        # Convert tensors to numpy
+        images_np = images.cpu().numpy()
+        mask_np = mask.cpu().numpy() if mask is not None else None
+        
+        # Parse mask color
+        rgba_color = self.hex_to_rgba(mask_color)
+        
+        image_data = []
+        original_dimensions = []
+        scaled_dimensions = []
+        composed_images = []
+        
+        batch_size = images_np.shape[0]
+        
+        for i in range(batch_size):
+            # Get image
+            img_np = images_np[i]
+            img_np = np.clip(img_np, 0.0, 1.0)
+            
+            # Convert image to uint8
+            img_uint8 = (img_np * 255.0).astype(np.uint8)
+            h, w = img_uint8.shape[:2]
+            
+            # Convert to PIL
+            img_pil = Image.fromarray(img_uint8)
+            
+            # Store original dimensions
+            orig_w, orig_h = img_pil.size
+            original_dimensions.append([orig_w, orig_h])
+            
+            # Apply mask overlay if mask is provided
+            if mask_np is not None:
+                # Get mask (handle single mask or batch)
+                if i < mask_np.shape[0]:
+                    mask_frame = mask_np[i]
+                else:
+                    mask_frame = mask_np[0]  # Use first mask if batch is smaller
+                
+                # Resize mask to match image dimensions if needed
+                if mask_frame.shape[0] != h or mask_frame.shape[1] != w:
+                    mask_frame = cv2.resize(mask_frame, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                # Ensure image is RGBA for compositing
+                if img_pil.mode != 'RGBA':
+                    img_pil = img_pil.convert('RGBA')
+                
+                # Create mask overlay layer
+                # mask_frame values are 0-1, where 1 = fully masked
+                mask_overlay = np.zeros((h, w, 4), dtype=np.uint8)
+                mask_overlay[:, :, 0] = rgba_color[0]  # R
+                mask_overlay[:, :, 1] = rgba_color[1]  # G
+                mask_overlay[:, :, 2] = rgba_color[2]  # B
+                # Alpha channel of overlay = mask * color_alpha
+                mask_overlay[:, :, 3] = (mask_frame * rgba_color[3]).astype(np.uint8)
+                
+                # Convert mask overlay to PIL
+                mask_overlay_pil = Image.fromarray(mask_overlay, 'RGBA')
+                
+                # Composite: base image + mask overlay
+                img_pil = Image.alpha_composite(img_pil, mask_overlay_pil)
+            
+            # --- Scaling happens here ---
+            if abs(scale_by - 1.0) > 1e-6 and scale_by > 0:
+                new_w = max(1, int(round(orig_w * scale_by)))
+                new_h = max(1, int(round(orig_h * scale_by)))
+                # Resize using NEAREST neighbor
+                img_pil = img_pil.resize((new_w, new_h), Image.NEAREST)
+            else:
+                # If no scaling, scaled dimensions are same as original
+                new_w, new_h = orig_w, orig_h
+            # --- End Scaling ---
+            
+            # Store scaled dimensions
+            scaled_dimensions.append([new_w, new_h])
+            
+            # Convert back to tensor for output
+            img_array = np.array(img_pil).astype(np.float32) / 255.0
+            composed_images.append(torch.from_numpy(img_array))
+            
+            # Save the image to a temporary location for preview
+            output_dir = folder_paths.get_temp_directory()
+            filename = f"smart_video_masked_{random.randint(1000000, 9999999)}.png"
+            file_path = os.path.join(output_dir, filename)
+            img_pil.save(file_path)
+            image_data.append({
+                "filename": filename,
+                "subfolder": "",
+                "type": "temp"
+            })
+        
+        # Stack composed images into batch
+        composed_batch = torch.stack(composed_images)
+        
+        # Return with both output tensor and UI preview
+        return {
+            "ui": {
+                "video_frames": image_data,
+                "fps": [fps],
+                "original_dimensions": original_dimensions,
+                "scaled_dimensions": scaled_dimensions
+            },
+            "result": (composed_batch,)
+        }
 
 
 class SmartSaveAnimatedPNG:
@@ -2666,6 +2838,698 @@ class SmartGradientDeformation:
 
         return (deformed_batch, gradient_batch)
 
+
+class SmartColorMatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "target": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "method": (
+                    [   
+                        'mkl',
+                        'hm', 
+                        'reinhard', 
+                        'mvgd', 
+                        'hm-mvgd-hm', 
+                        'hm-mkl-hm',
+                    ], {
+                        "default": 'mkl'
+                    }),
+            },
+            "optional": {
+                "reference_end": ("IMAGE",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "multithread": ("BOOLEAN", {"default": True}),
+            }
+        }
+    
+    CATEGORY = "SmartImageTools"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "colormatch"
+    DESCRIPTION = """
+Smart Color Match with progressive reference blending.
+
+If reference_end is not provided, works like standard color matching.
+If reference_end is provided with a batch of target images, the reference 
+gradually transitions from 'reference' to 'reference_end' across the sequence.
+
+Based on color-matcher by hahnec:
+https://github.com/hahnec/color-matcher/
+"""
+    
+    def colormatch(self, target, reference, method, reference_end=None, strength=1.0, multithread=True):
+        try:
+            from color_matcher import ColorMatcher
+        except:
+            raise Exception("Can't import color-matcher, did you install requirements.txt? Manual install: pip install color-matcher")
+        
+        target = target.cpu()
+        reference = reference.cpu()
+        if reference_end is not None:
+            reference_end = reference_end.cpu()
+        
+        batch_size = target.size(0)
+        
+        target_images = target.squeeze()
+        reference_images = reference.squeeze()
+        
+        target_np = target_images.numpy()
+        reference_np = reference_images.numpy()
+        
+        if reference_end is not None:
+            reference_end_images = reference_end.squeeze()
+            reference_end_np = reference_end_images.numpy()
+        else:
+            reference_end_np = None
+
+        def process(i):
+            cm = ColorMatcher()
+            target_np_i = target_np if batch_size == 1 else target_images[i].numpy()
+            
+            # Store original alpha if present
+            target_has_alpha = target_np_i.shape[-1] == 4
+            if target_has_alpha:
+                target_alpha = target_np_i[:, :, 3].copy()
+                target_rgb = target_np_i[:, :, :3].copy()
+                # Fill fully transparent pixels with black
+                transparent_mask = target_alpha < 0.01
+                target_rgb[transparent_mask] = 0.0
+            else:
+                target_rgb = target_np_i
+            
+            try:
+                if reference_end_np is None:
+                    # No blending - single color match
+                    reference_np_i = reference_np if reference.size(0) == 1 else reference_images[i].numpy()
+                    
+                    # Handle reference alpha channel
+                    ref_has_alpha = reference_np_i.shape[-1] == 4
+                    if ref_has_alpha:
+                        ref_alpha = reference_np_i[:, :, 3]
+                        ref_rgb = reference_np_i[:, :, :3].copy()
+                        # Fill fully transparent pixels with black
+                        ref_transparent_mask = ref_alpha < 0.01
+                        ref_rgb[ref_transparent_mask] = 0.0
+                    else:
+                        ref_rgb = reference_np_i
+                    
+                    # Perform color matching on RGB channels only
+                    image_result = cm.transfer(src=target_rgb, ref=ref_rgb, method=method)
+                    image_result = target_rgb + strength * (image_result - target_rgb)
+                    image_result = np.clip(image_result, 0.0, 1.0)
+                else:
+                    # Progressive blending - do two color matches and blend results
+                    if batch_size > 1:
+                        progress = i / (batch_size - 1)
+                    else:
+                        progress = 0.0
+                    
+                    # Get reference images (use first frame if single frame reference)
+                    ref1 = reference_np if reference.size(0) == 1 else reference_images[i if i < reference.size(0) else 0].numpy()
+                    ref2 = reference_end_np if reference_end.size(0) == 1 else reference_end_images[i if i < reference_end.size(0) else 0].numpy()
+                    
+                    # Process ref1
+                    ref1_has_alpha = ref1.shape[-1] == 4
+                    if ref1_has_alpha:
+                        ref1_alpha = ref1[:, :, 3]
+                        ref1_rgb = ref1[:, :, :3].copy()
+                        ref1_transparent_mask = ref1_alpha < 0.01
+                        ref1_rgb[ref1_transparent_mask] = 0.0
+                    else:
+                        ref1_rgb = ref1
+                    
+                    # Process ref2
+                    ref2_has_alpha = ref2.shape[-1] == 4
+                    if ref2_has_alpha:
+                        ref2_alpha = ref2[:, :, 3]
+                        ref2_rgb = ref2[:, :, :3].copy()
+                        ref2_transparent_mask = ref2_alpha < 0.01
+                        ref2_rgb[ref2_transparent_mask] = 0.0
+                    else:
+                        ref2_rgb = ref2
+                    
+                    # Perform color matching with ref1
+                    result1 = cm.transfer(src=target_rgb, ref=ref1_rgb, method=method)
+                    result1 = target_rgb + strength * (result1 - target_rgb)
+                    result1 = np.clip(result1, 0.0, 1.0)
+                    
+                    # Perform color matching with ref2
+                    result2 = cm.transfer(src=target_rgb, ref=ref2_rgb, method=method)
+                    result2 = target_rgb + strength * (result2 - target_rgb)
+                    result2 = np.clip(result2, 0.0, 1.0)
+                    
+                    # Blend the two results based on progress
+                    image_result = result1 * (1.0 - progress) + result2 * progress
+                    image_result = np.clip(image_result, 0.0, 1.0)
+                
+                # If target had alpha, restore it
+                if target_has_alpha:
+                    result_with_alpha = np.zeros((image_result.shape[0], image_result.shape[1], 4), dtype=np.float32)
+                    result_with_alpha[:, :, :3] = image_result
+                    result_with_alpha[:, :, 3] = target_alpha
+                    return torch.from_numpy(result_with_alpha)
+                else:
+                    return torch.from_numpy(image_result)
+            except Exception as e:
+                print(f"Frame {i} color match error: {e}")
+                return torch.from_numpy(target_np_i)  # fallback
+
+        if multithread and batch_size > 1:
+            max_threads = min(os.cpu_count() or 1, batch_size)
+            with ThreadPoolExecutor(max_workers=max_threads) as executor:
+                out = list(executor.map(process, range(batch_size)))
+        else:
+            out = [process(i) for i in range(batch_size)]
+
+        out = torch.stack(out, dim=0).to(torch.float32)
+        out.clamp_(0, 1)
+        return (out,)
+
+
+class SmartImageCrop:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "measurement": (["pixels", "percent"],),
+                "left": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+                "right": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+                "top": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+                "bottom": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "crop_image"
+    CATEGORY = "SmartImageTools"
+
+    def crop_image(self, image, measurement, left, right, top, bottom):
+        batch_size = image.shape[0]
+        output_images = []
+
+        for i in range(batch_size):
+            img_tensor = image[i]
+            h, w = img_tensor.shape[:2]
+            channels = img_tensor.shape[2]
+            has_alpha = channels == 4
+
+            # Convert percent to pixels if needed
+            if measurement == "percent":
+                left_px = int(round(w * left / 100.0))
+                right_px = int(round(w * right / 100.0))
+                top_px = int(round(h * top / 100.0))
+                bottom_px = int(round(h * bottom / 100.0))
+            else:  # pixels
+                left_px = left
+                right_px = right
+                top_px = top
+                bottom_px = bottom
+
+            # Calculate new dimensions
+            new_w = w - left_px - right_px
+            new_h = h - top_px - bottom_px
+
+            # Ensure dimensions are at least 1
+            new_w = max(1, new_w)
+            new_h = max(1, new_h)
+
+            # Create output image
+            if has_alpha:
+                output_img = torch.zeros((new_h, new_w, 4), dtype=img_tensor.dtype, device=img_tensor.device)
+            else:
+                output_img = torch.zeros((new_h, new_w, 3), dtype=img_tensor.dtype, device=img_tensor.device)
+
+            # Calculate source and destination regions
+            # Source region in original image
+            src_top = max(0, top_px)
+            src_bottom = min(h, h - bottom_px)
+            src_left = max(0, left_px)
+            src_right = min(w, w - right_px)
+
+            # Destination region in output image
+            dst_top = max(0, -top_px)
+            dst_left = max(0, -left_px)
+
+            # Calculate how much we can actually copy
+            copy_h = min(src_bottom - src_top, new_h - dst_top)
+            copy_w = min(src_right - src_left, new_w - dst_left)
+
+            # Ensure we don't copy negative amounts
+            if copy_h > 0 and copy_w > 0:
+                # Copy the overlapping region
+                output_img[dst_top:dst_top+copy_h, dst_left:dst_left+copy_w] = \
+                    img_tensor[src_top:src_top+copy_h, src_left:src_left+copy_w]
+
+            output_images.append(output_img)
+
+        # Stack all processed images
+        output_batch = torch.stack(output_images)
+        return (output_batch,)
+
+
+class SmartFillTransparentHoles:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "target": ("IMAGE",),
+                "source": ("IMAGE",),
+                "min_hole_size": ("INT", {"default": 1, "min": 1, "max": 100000, "step": 1}),
+                "max_hole_size": ("INT", {"default": 15, "min": 1, "max": 100000, "step": 1}),
+                "threshold": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "blend": ("BOOLEAN", {"default": True}),
+                "ignore_left": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "ignore_right": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "ignore_top": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "ignore_bottom": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "filled_mask")
+    FUNCTION = "fill_holes"
+    CATEGORY = "SmartImageTools"
+    
+    def process_single_image(self, target_img, source_img, min_hole_size, max_hole_size, threshold, blend, 
+                            ignore_left, ignore_right, ignore_top, ignore_bottom):
+        """Process a single image - optimized with scipy connected components."""
+        from scipy import ndimage
+        
+        h, w = target_img.shape[:2]
+        
+        # Resize source if dimensions don't match
+        sh, sw = source_img.shape[:2]
+        if sh != h or sw != w:
+            source_img = cv2.resize(source_img, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        # Ensure source has same channel count as target
+        if source_img.shape[2] != target_img.shape[2]:
+            if target_img.shape[2] == 4 and source_img.shape[2] == 3:
+                alpha = np.ones((h, w, 1), dtype=source_img.dtype)
+                source_img = np.concatenate([source_img, alpha], axis=2)
+            elif target_img.shape[2] == 3 and source_img.shape[2] == 4:
+                source_img = source_img[:, :, :3]
+        
+        # Check if target has alpha channel
+        if target_img.shape[2] == 4:
+            # Copy input to output buffer
+            output_img = target_img.copy()
+            
+            # Extract transparency mask (alpha channel)
+            alpha = target_img[:, :, 3]
+            
+            # Threshold the transparency mask (0 = transparent, 1 = opaque)
+            binary_mask = (alpha < threshold).astype(np.uint8)
+            
+            # Create processing area mask (areas not to be ignored)
+            processing_mask = np.ones((h, w), dtype=bool)
+            # Apply ignore margins
+            if ignore_left > 0:
+                processing_mask[:, :ignore_left] = False
+            if ignore_right > 0:
+                processing_mask[:, -ignore_right:] = False
+            if ignore_top > 0:
+                processing_mask[:ignore_top, :] = False
+            if ignore_bottom > 0:
+                processing_mask[-ignore_bottom:, :] = False
+            
+            # Create filled area mask
+            filled_area_mask = np.zeros((h, w), dtype=np.float32)
+            
+            # Use scipy's label to find connected components (much faster than manual flood fill)
+            # structure defines 4-connectivity
+            structure = np.array([[0, 1, 0],
+                                  [1, 1, 1],
+                                  [0, 1, 0]], dtype=np.uint8)
+            labeled, num_features = ndimage.label(binary_mask, structure=structure)
+            
+            if num_features > 0:
+                # Get properties of each region efficiently
+                # Calculate sizes
+                sizes = ndimage.sum(binary_mask, labeled, range(1, num_features + 1))
+                
+                # Check which regions touch edges
+                edge_mask = np.zeros((h, w), dtype=bool)
+                edge_mask[0, :] = True
+                edge_mask[-1, :] = True
+                edge_mask[:, 0] = True
+                edge_mask[:, -1] = True
+                
+                touches_edge = np.zeros(num_features + 1, dtype=bool)
+                touches_ignore = np.zeros(num_features + 1, dtype=bool)
+                
+                for label_id in range(1, num_features + 1):
+                    region_mask = (labeled == label_id)
+                    # Check if region touches image edges
+                    if np.any(region_mask & edge_mask):
+                        touches_edge[label_id] = True
+                    # Check if region overlaps with ignored areas
+                    if np.any(region_mask & ~processing_mask):
+                        touches_ignore[label_id] = True
+                
+                # Get source data
+                if source_img.shape[2] == 4:
+                    source_rgb = source_img[:, :, :3]
+                    source_alpha = source_img[:, :, 3]
+                else:
+                    source_rgb = source_img
+                    source_alpha = np.ones((h, w), dtype=np.float32)
+                
+                # Process each region
+                for label_id in range(1, num_features + 1):
+                    area_size = sizes[label_id - 1]
+                    
+                    # Skip if touches edge
+                    if touches_edge[label_id]:
+                        continue
+                    
+                    # Skip if touches ignored area
+                    if touches_ignore[label_id]:
+                        continue
+                    
+                    # Skip if out of size range
+                    if area_size < min_hole_size or area_size > max_hole_size:
+                        continue
+                    
+                    # Get mask for this region
+                    fill_mask = (labeled == label_id)
+                    
+                    # Copy original alpha to filled area mask
+                    filled_area_mask[fill_mask] = alpha[fill_mask]
+                    
+                    # Perform fill/blend in output buffer
+                    if blend:
+                        # Alpha blend mode
+                        target_rgb = target_img[:, :, :3]
+                        target_alpha = alpha
+                        
+                        # Expand dimensions for broadcasting
+                        target_alpha_3d = target_alpha[:, :, np.newaxis]
+                        
+                        # Blend: result = target * target_alpha + source * (1 - target_alpha)
+                        blended_rgb = target_rgb * target_alpha_3d + source_rgb * (1.0 - target_alpha_3d)
+                        output_img[:, :, :3][fill_mask] = blended_rgb[fill_mask]
+                        
+                        # Composite alpha: new_alpha = target_alpha + source_alpha * (1 - target_alpha)
+                        new_alpha = target_alpha + source_alpha * (1.0 - target_alpha)
+                        output_img[:, :, 3][fill_mask] = new_alpha[fill_mask]
+                    else:
+                        # Direct copy mode
+                        output_img[:, :, :3][fill_mask] = source_rgb[fill_mask]
+                        output_img[:, :, 3][fill_mask] = source_alpha[fill_mask]
+            
+            # Ensure output is in valid range
+            output_img = np.clip(output_img, 0.0, 1.0)
+            return output_img, filled_area_mask
+        else:
+            # Target has no alpha channel, return as is
+            target_img = np.clip(target_img, 0.0, 1.0)
+            return target_img, np.zeros((h, w), dtype=np.float32)
+    
+    def fill_holes(self, target, source, min_hole_size, max_hole_size, threshold, blend, 
+                   ignore_left, ignore_right, ignore_top, ignore_bottom):
+        # Convert from tensor to numpy array
+        target_np = target.cpu().numpy()
+        source_np = source.cpu().numpy()
+        
+        batch_size = target_np.shape[0]
+        
+        # Process batch in parallel using ThreadPoolExecutor
+        def process_batch_item(i):
+            target_img = target_np[i].copy()
+            
+            # Get or use first source image
+            if i < source_np.shape[0]:
+                source_img = source_np[i].copy()
+            else:
+                source_img = source_np[0].copy()
+            
+            return self.process_single_image(target_img, source_img, min_hole_size, max_hole_size, threshold, blend,
+                                            ignore_left, ignore_right, ignore_top, ignore_bottom)
+        
+        # Use multithreading for batch processing
+        with ThreadPoolExecutor(max_workers=min(batch_size, os.cpu_count() or 1)) as executor:
+            results = list(executor.map(process_batch_item, range(batch_size)))
+        
+        # Separate images and masks
+        output_images = [result[0] for result in results]
+        output_masks = [result[1] for result in results]
+        
+        # Convert back to tensors
+        output_tensor = torch.from_numpy(np.stack(output_images)).float()
+        mask_tensor = torch.from_numpy(np.stack(output_masks)).float()
+        
+        # Ensure values are in 0-1 range
+        output_tensor = torch.clamp(output_tensor, 0.0, 1.0)
+        mask_tensor = torch.clamp(mask_tensor, 0.0, 1.0)
+        
+        return (output_tensor, mask_tensor)
+
+
+class SmartProgressiveScaleImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "start_scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+                "end_scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+                "scale_method": (["nearest", "bilinear", "bicubic", "lanczos", "area"],),
+                "curve_exponent": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 10.0, "step": 0.01}),
+                "end_offset_x": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+                "end_offset_y": ("INT", {"default": 0, "min": -8192, "max": 8192, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "progressive_scale"
+    CATEGORY = "SmartImageTools"
+
+    def progressive_scale(self, images, start_scale, end_scale, scale_method, curve_exponent, end_offset_x, end_offset_y):
+        batch_size = images.shape[0]
+        
+        # Map scale method names to cv2 interpolation constants
+        method_map = {
+            "nearest": cv2.INTER_NEAREST,
+            "bilinear": cv2.INTER_LINEAR,
+            "bicubic": cv2.INTER_CUBIC,
+            "lanczos": cv2.INTER_LANCZOS4,
+            "area": cv2.INTER_AREA,
+        }
+        
+        interp_method = method_map.get(scale_method, cv2.INTER_LINEAR)
+        
+        scaled_images = []
+        image_offsets = []
+        
+        for i in range(batch_size):
+            # Calculate progress through the batch (0.0 to 1.0)
+            if batch_size > 1:
+                progress = i / (batch_size - 1)
+            else:
+                progress = 0.0
+            
+            # Apply curve exponent to progress
+            curved_progress = progress ** curve_exponent
+            
+            # Calculate scale factor for this image
+            scale_factor = start_scale + (end_scale - start_scale) * curved_progress
+            
+            # Calculate offset for this image (progressively increase from 0 to end_offset)
+            offset_x = int(round(end_offset_x * curved_progress))
+            offset_y = int(round(end_offset_y * curved_progress))
+            image_offsets.append((offset_x, offset_y))
+            
+            # Get current image
+            img_tensor = images[i]
+            img_np = img_tensor.cpu().numpy()
+            
+            # Convert to uint8 for cv2 processing
+            img_np = np.clip(img_np, 0.0, 1.0)
+            img_uint8 = (img_np * 255.0).astype(np.uint8)
+            
+            h, w = img_uint8.shape[:2]
+            new_h = max(1, int(round(h * scale_factor)))
+            new_w = max(1, int(round(w * scale_factor)))
+            
+            # Resize image
+            if h == 0 or w == 0:
+                # Handle empty image case
+                scaled_img = np.zeros((new_h, new_w, img_uint8.shape[2]), dtype=np.uint8)
+            else:
+                scaled_img = cv2.resize(img_uint8, (new_w, new_h), interpolation=interp_method)
+            
+            # Handle potential shape issues after resize (e.g., grayscale losing channel dim)
+            if len(scaled_img.shape) == 2 and len(img_uint8.shape) == 3:
+                scaled_img = np.expand_dims(scaled_img, axis=-1)
+                if img_uint8.shape[2] > 1:
+                    scaled_img = scaled_img.repeat(img_uint8.shape[2], axis=-1)
+            
+            # Convert back to float [0, 1]
+            scaled_img_float = scaled_img.astype(np.float32) / 255.0
+            scaled_images.append(torch.from_numpy(scaled_img_float))
+        
+        # Check if we need offset logic or can use simpler logic
+        if end_offset_x == 0 and end_offset_y == 0:
+            # No offsets - use original logic: only pad if sizes differ, and center images
+            shapes = [img.shape for img in scaled_images]
+            if len(set(shapes)) == 1:
+                # All images have the same shape, stack normally
+                output_batch = torch.stack(scaled_images)
+            else:
+                # Images have different shapes - pad to max size and center
+                max_h = max(img.shape[0] for img in scaled_images)
+                max_w = max(img.shape[1] for img in scaled_images)
+                channels = scaled_images[0].shape[2]
+                
+                padded_images = []
+                for img in scaled_images:
+                    h, w = img.shape[:2]
+                    if h == max_h and w == max_w:
+                        padded_images.append(img)
+                    else:
+                        # Create padded image
+                        padded = torch.zeros((max_h, max_w, channels), dtype=img.dtype)
+                        # Center the image
+                        y_offset = (max_h - h) // 2
+                        x_offset = (max_w - w) // 2
+                        padded[y_offset:y_offset+h, x_offset:x_offset+w] = img
+                        padded_images.append(padded)
+                
+                output_batch = torch.stack(padded_images)
+        else:
+            # Offsets are used - calculate canvas size and position images
+            max_h = 0
+            max_w = 0
+            min_offset_x = 0
+            min_offset_y = 0
+            
+            for img, (off_x, off_y) in zip(scaled_images, image_offsets):
+                h, w = img.shape[:2]
+                # Track the minimum offset (for negative offsets)
+                min_offset_x = min(min_offset_x, off_x)
+                min_offset_y = min(min_offset_y, off_y)
+                # Calculate maximum canvas size needed
+                max_w = max(max_w, w + off_x)
+                max_h = max(max_h, h + off_y)
+            
+            # Adjust canvas size to account for negative offsets
+            canvas_w = max_w - min_offset_x
+            canvas_h = max_h - min_offset_y
+            
+            channels = scaled_images[0].shape[2]
+            
+            # Create padded/positioned images on the canvas
+            positioned_images = []
+            for img, (off_x, off_y) in zip(scaled_images, image_offsets):
+                h, w = img.shape[:2]
+                
+                # Create canvas with transparent/black background
+                canvas = torch.zeros((canvas_h, canvas_w, channels), dtype=img.dtype)
+                
+                # Calculate position on canvas (accounting for negative offsets)
+                y_pos = off_y - min_offset_y
+                x_pos = off_x - min_offset_x
+                
+                # Place image on canvas
+                canvas[y_pos:y_pos+h, x_pos:x_pos+w] = img
+                positioned_images.append(canvas)
+            
+            output_batch = torch.stack(positioned_images)
+        
+        return (output_batch,)
+
+
+class SmartColorFillMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+                "color": ("COLOR", {"default": "#FFFFFF"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "fill_color"
+    CATEGORY = "SmartImageTools"
+
+    def hex_to_rgb(self, hex_color):
+        """Convert hex color string to RGB tuple (0-255 range)."""
+        hex_color = hex_color.lstrip('#')
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+    def fill_color(self, image, mask, invert_mask, color):
+        # Convert from tensor to numpy array
+        input_image = 255. * image.cpu().numpy()
+        mask_np = mask.cpu().numpy()
+        batch_size = input_image.shape[0]
+        output_images = []
+
+        # Convert hex color to RGB
+        fill_rgb = self.hex_to_rgb(color)
+
+        for i in range(batch_size):
+            img = input_image[i].copy()
+            h, w = img.shape[:2]
+            channels = img.shape[2] if len(img.shape) > 2 else 0
+
+            # Get mask for this image
+            if i < mask_np.shape[0]:
+                current_mask = mask_np[i]
+            else:
+                # If batch size mismatch, use last available mask
+                current_mask = mask_np[-1]
+
+            # Invert mask if requested
+            # Mask: 1.0 = fill with color, 0.0 = keep original
+            if invert_mask:
+                current_mask = 1.0 - current_mask
+
+            # Ensure mask matches image dimensions
+            if current_mask.shape[0] != h or current_mask.shape[1] != w:
+                # Resize mask to match image
+                current_mask = cv2.resize(current_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+            # Create mask for broadcasting (h, w, 1)
+            mask_3d = current_mask[:, :, np.newaxis]
+
+            if channels == 3:
+                # RGB image
+                result = img.copy()
+                # Apply color where mask is 1.0
+                fill_color_array = np.array(fill_rgb, dtype=np.float32)
+                result = img * (1.0 - mask_3d) + fill_color_array * mask_3d
+                result = np.clip(result, 0, 255).astype(np.uint8)
+                output_images.append(result)
+
+            elif channels == 4:
+                # RGBA image
+                result = img.copy()
+                # Apply color to RGB channels where mask is 1.0
+                fill_color_array = np.array(fill_rgb, dtype=np.float32)
+                result[:, :, :3] = img[:, :, :3] * (1.0 - mask_3d) + fill_color_array * mask_3d
+                # Keep alpha channel unchanged
+                result = np.clip(result, 0, 255).astype(np.uint8)
+                output_images.append(result)
+
+            else:
+                # Unexpected number of channels - pass through
+                output_images.append(img.astype(np.uint8))
+
+        # Convert back to tensor (0-1 range)
+        output_array = np.stack(output_images) / 255.0
+        output_tensor = torch.from_numpy(output_array).float()
+
+        return (output_tensor,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
@@ -2681,6 +3545,7 @@ NODE_CLASS_MAPPINGS = {
     "SmartImagePaletteExtract": SmartImagePaletteExtract,
     "SmartSemiTransparenceRemove": SmartSemiTransparenceRemove,
     "SmartVideoPreviewScaled": SmartVideoPreviewScaled,
+    "SmartVideoPreviewScaledMasked": SmartVideoPreviewScaledMasked,
     "SmartSaveAnimatedPNG": SmartSaveAnimatedPNG,
     "SmartSavePNG": SmartSavePNG,
     "SmartDrawPoints": SmartDrawPoints,
@@ -2689,7 +3554,12 @@ NODE_CLASS_MAPPINGS = {
     "SmartBackgroundFill": SmartBackgroundFill,
     "SmartGetMask": SmartGetMask,
     "SmartImagePadding": SmartImagePadding,
-    "SmartGradientDeformation": SmartGradientDeformation
+    "SmartGradientDeformation": SmartGradientDeformation,
+    "SmartColorMatch": SmartColorMatch,
+    "SmartImageCrop": SmartImageCrop,
+    "SmartFillTransparentHoles": SmartFillTransparentHoles,
+    "SmartProgressiveScaleImage": SmartProgressiveScaleImage,
+    "SmartColorFillMask": SmartColorFillMask
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2707,6 +3577,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartImagePaletteExtract": "Smart Image Palette Extract",
     "SmartSemiTransparenceRemove": "Smart Semi-Transparence Remove",
     "SmartVideoPreviewScaled": "Smart Video Preview Scaled",
+    "SmartVideoPreviewScaledMasked": "Smart Video Preview Scaled Masked",
     "SmartSaveAnimatedPNG": "Smart Save Animated Image",
     "SmartSavePNG": "Smart Save PNG",
     "SmartDrawPoints": "Smart Draw Points",
@@ -2715,5 +3586,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SmartBackgroundFill": "Smart Background Fill",
     "SmartGetMask": "Smart Get Mask",
     "SmartImagePadding": "Smart Image Padding",
-    "SmartGradientDeformation": "Smart Gradient Deformation"
+    "SmartGradientDeformation": "Smart Gradient Deformation",
+    "SmartColorMatch": "Smart Color Match",
+    "SmartImageCrop": "Smart Image Crop",
+    "SmartFillTransparentHoles": "Smart Fill Transparent Holes",
+    "SmartProgressiveScaleImage": "Smart Progressive Scale Image",
+    "SmartColorFillMask": "Smart Color Fill Mask"
 } 
