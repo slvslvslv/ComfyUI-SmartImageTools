@@ -159,6 +159,11 @@ def _flood_fill_core_numba(img, start_x, start_y, bg_color, max_color_diff, max_
     return (mask == 1).astype(np.uint8)  
 
 class SmartImagePaletteConvert:
+    ALGORITHM_HYBRID = "Hybrid Lab/RGB K-Means"
+    ALGORITHM_PERCEPTUAL = "Perceptual (Lab)"
+    ALGORITHM_KMEANS_RGB = "K-Means (RGB)"
+    ALGORITHM_SELECTIVE = "Selective"
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -166,6 +171,12 @@ class SmartImagePaletteConvert:
                 "image": ("IMAGE",),
                 "num_colors": ("INT", {"default": 8, "min": 2, "max": 256, "step": 1}),
                 "dithering_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "display": "slider"}),
+                "algorithm": ([
+                    s.ALGORITHM_HYBRID,
+                    s.ALGORITHM_PERCEPTUAL,
+                    s.ALGORITHM_KMEANS_RGB,
+                    s.ALGORITHM_SELECTIVE,
+                ], {"default": s.ALGORITHM_HYBRID}),
             },
             "optional": {
                 "reference_image": ("IMAGE",),
@@ -190,26 +201,22 @@ class SmartImagePaletteConvert:
         color_data = [] # List to store (sort_key, original_color)
 
         for color_val in palette:
-            rgb = color_val[:3] / 255.0
-            alpha = color_val[3] / 255.0 if has_alpha else 1.0
             is_transparent = has_alpha and color_val[3] == 0
 
-            h, l, s = colorsys.rgb_to_hls(rgb[0], rgb[1], rgb[2])
-
-            # Define hue_value for sorting
-            # -2: Transparent
-            # -1: Achromatic (Gray/Black/White)
-            # 0-1: Chromatic hue
             if is_transparent:
                 hue_value = -2
-                # Use luminance of black for sorting transparent
                 l = 0.0
                 s = 0.0
-            elif s < 0.05 or l < 0.01 or l > 0.99: # Achromatic threshold (low saturation or near black/white)
-                hue_value = -1
-                 # Keep actual luminance and saturation for sorting grays
             else:
-                hue_value = h
+                rgb = np.clip(color_val[:3], 0.0, 255.0) / 255.0
+                h, l, s = colorsys.rgb_to_hls(rgb[0], rgb[1], rgb[2])
+                if s < 0.05 or l < 0.01 or l > 0.99: # Achromatic threshold (low saturation or near black/white)
+                    hue_value = -1
+                else:
+                    hue_value = h
+
+            if not is_transparent and (s < 0.05 or l < 0.01 or l > 0.99):
+                hue_value = -1
 
             # Sort key: Hue -> Luminance -> Saturation
             sort_key = (hue_value, l, s)
@@ -243,6 +250,334 @@ class SmartImagePaletteConvert:
         closest_colors = palette[indices]
 
         return closest_colors, indices
+
+    @staticmethod
+    def _empty_palette(img):
+        channel_count = img.shape[2] if img.ndim == 3 else 3
+        return np.zeros((1, channel_count), dtype=np.float32)
+
+    @staticmethod
+    def _compute_palette_seed(pixel_data):
+        if pixel_data.size == 0:
+            return 42
+        clipped = np.clip(pixel_data, 0, 255).astype(np.uint8, copy=False)
+        digest = hashlib.sha256(clipped.tobytes()).digest()
+        return int.from_bytes(digest[:8], "little") & 0x7FFFFFFF
+
+    @staticmethod
+    def _resize_for_palette(img, max_dim=256):
+        h, w = img.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            return cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+        return img
+
+    @staticmethod
+    def _extract_opaque_rgb(img):
+        img_flat = img.reshape(-1, img.shape[2]).astype(np.float32)
+        if img.shape[2] == 4:
+            return img_flat[img_flat[:, 3] > 0][:, :3]
+        return img_flat[:, :3]
+
+    @staticmethod
+    def _build_palette_from_centers(img, centers_rgb_float, has_transparency=True):
+        centers_rgb_float = np.asarray(centers_rgb_float, dtype=np.float32)
+        if centers_rgb_float.ndim == 1:
+            centers_rgb_float = centers_rgb_float.reshape(1, -1)
+
+        if has_transparency:
+            transparent_rgb = np.array([-99999.0, -99999.0, -99999.0], dtype=np.float32)
+            if img.shape[2] == 4:
+                palette = np.zeros((len(centers_rgb_float) + 1, 4), dtype=np.float32)
+                if len(centers_rgb_float) > 0:
+                    palette[:-1, :3] = centers_rgb_float
+                    palette[:-1, 3] = 255.0
+                palette[-1, :3] = transparent_rgb
+                palette[-1, 3] = 0.0
+            else:
+                palette = np.zeros((len(centers_rgb_float) + 1, 3), dtype=np.float32)
+                if len(centers_rgb_float) > 0:
+                    palette[:-1] = centers_rgb_float
+                palette[-1] = transparent_rgb
+        else:
+            if img.shape[2] == 4:
+                palette = np.zeros((len(centers_rgb_float), 4), dtype=np.float32)
+                if len(centers_rgb_float) > 0:
+                    palette[:, :3] = centers_rgb_float
+                    palette[:, 3] = 255.0
+            else:
+                palette = centers_rgb_float.astype(np.float32, copy=False)
+
+        return SmartImagePaletteConvert._sort_palette(palette)
+
+    @staticmethod
+    def _compute_weighted_unique_colors(rgb_pixels):
+        rgb_uint8 = np.clip(rgb_pixels, 0, 255).astype(np.uint8, copy=False)
+        unique_rgb, counts = np.unique(rgb_uint8, axis=0, return_counts=True)
+        return unique_rgb.astype(np.float32), counts.astype(np.float64)
+
+    @staticmethod
+    def _weighted_kmeans(points, weights, num_clusters, seed, max_iterations=50, convergence_threshold=0.1):
+        if len(points) == 0:
+            return np.zeros((1, points.shape[1] if points.ndim == 2 else 3), dtype=np.float32)
+
+        points = np.asarray(points, dtype=np.float32)
+        weights = np.asarray(weights, dtype=np.float64)
+        k = max(1, min(int(num_clusters), len(points)))
+        rng = np.random.default_rng(seed)
+
+        centers = np.zeros((k, points.shape[1]), dtype=np.float32)
+        cumulative_weights = np.cumsum(weights)
+        first_pick = rng.random() * cumulative_weights[-1]
+        first_idx = min(np.searchsorted(cumulative_weights, first_pick, side="right"), len(points) - 1)
+        centers[0] = points[first_idx]
+
+        min_dist_sq = np.full(len(points), np.inf, dtype=np.float64)
+        for center_idx in range(1, k):
+            diff = points - centers[center_idx - 1]
+            dist_sq = np.sum(diff * diff, axis=1)
+            min_dist_sq = np.minimum(min_dist_sq, dist_sq)
+            weighted_dist_sq = min_dist_sq * weights
+            total = float(np.sum(weighted_dist_sq))
+            if total <= 0.0:
+                centers[center_idx:] = points[:k - center_idx]
+                break
+
+            pick = rng.random() * total
+            next_idx = min(np.searchsorted(np.cumsum(weighted_dist_sq), pick, side="right"), len(points) - 1)
+            centers[center_idx] = points[next_idx]
+
+        for _ in range(max_iterations):
+            diff = points[:, np.newaxis, :] - centers[np.newaxis, :, :]
+            distances_sq = np.sum(diff * diff, axis=2)
+            assignments = np.argmin(distances_sq, axis=1)
+
+            new_centers = centers.copy()
+            max_shift = 0.0
+            for cluster_idx in range(k):
+                mask = assignments == cluster_idx
+                if np.any(mask):
+                    cluster_weights = weights[mask]
+                    weighted_sum = np.sum(points[mask] * cluster_weights[:, np.newaxis], axis=0)
+                    updated_center = weighted_sum / np.sum(cluster_weights)
+                    shift = float(np.sum((centers[cluster_idx] - updated_center) ** 2))
+                    max_shift = max(max_shift, shift)
+                    new_centers[cluster_idx] = updated_center.astype(np.float32)
+                else:
+                    new_centers[cluster_idx] = points[rng.integers(0, len(points))]
+
+            centers = new_centers
+            if max_shift < convergence_threshold:
+                break
+
+        return centers
+
+    @staticmethod
+    def _compute_saturation(rgb_pixels):
+        rgb_norm = np.clip(rgb_pixels, 0.0, 255.0) / 255.0
+        max_c = np.max(rgb_norm, axis=1)
+        min_c = np.min(rgb_norm, axis=1)
+        delta = max_c - min_c
+        lightness = (max_c + min_c) / 2.0
+
+        saturation = np.zeros_like(max_c, dtype=np.float32)
+        valid = (max_c != 0.0) & (delta != 0.0)
+
+        low_mask = valid & (lightness <= 0.5)
+        saturation[low_mask] = delta[low_mask] / np.maximum(max_c[low_mask] + min_c[low_mask], 1e-8)
+
+        high_mask = valid & (lightness > 0.5)
+        saturation[high_mask] = delta[high_mask] / np.maximum(2.0 - max_c[high_mask] - min_c[high_mask], 1e-8)
+
+        return saturation.astype(np.float32)
+
+    @staticmethod
+    def _compute_edge_strengths(img_rgb):
+        rgb_norm = np.clip(img_rgb.astype(np.float32), 0.0, 255.0) / 255.0
+        luminance = 0.299 * rgb_norm[:, :, 0] + 0.587 * rgb_norm[:, :, 1] + 0.114 * rgb_norm[:, :, 2]
+        gx = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
+        edge_strength = np.sqrt(gx * gx + gy * gy)
+        max_edge = float(np.max(edge_strength))
+        if max_edge > 0.0:
+            edge_strength /= max_edge
+        return edge_strength.astype(np.float32)
+
+    @staticmethod
+    def _make_selective_box(pixel_indices, rgb_pixels, weights, saturations):
+        box_rgb = rgb_pixels[pixel_indices]
+        min_rgb = np.min(box_rgb, axis=0)
+        max_rgb = np.max(box_rgb, axis=0)
+        ranges = max_rgb - min_rgb
+        total_weight = float(np.sum(weights[pixel_indices]))
+
+        if total_weight > 0.0:
+            avg_saturation = float(np.sum(weights[pixel_indices] * saturations[pixel_indices]) / total_weight)
+            weighted_color = np.sum(box_rgb * weights[pixel_indices, np.newaxis], axis=0) / total_weight
+        else:
+            avg_saturation = 0.0
+            weighted_color = np.mean(box_rgb, axis=0)
+
+        return {
+            "indices": pixel_indices,
+            "min_rgb": min_rgb,
+            "max_rgb": max_rgb,
+            "ranges": ranges,
+            "largest_channel": int(np.argmax(ranges)),
+            "largest_range": float(np.max(ranges)),
+            "total_weight": total_weight,
+            "avg_saturation": avg_saturation,
+            "weighted_color": weighted_color.astype(np.float32),
+        }
+
+    def _generate_palette_hybrid(self, img, num_colors, has_transparency=True):
+        img_small = self._resize_for_palette(img)
+        rgb = self._extract_opaque_rgb(img_small)
+
+        if len(rgb) == 0:
+            return self._empty_palette(img)
+
+        max_pixels = 10000
+        if len(rgb) > max_pixels:
+            seed = self._compute_palette_seed(rgb[:max_pixels])
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(len(rgb), max_pixels, replace=False)
+            rgb_subset = rgb[indices]
+        else:
+            rgb_subset = rgb
+
+        colors_to_extract = num_colors - 1 if has_transparency else num_colors
+        colors_to_extract = max(1, min(colors_to_extract, len(rgb_subset)))
+
+        rgb_normalized = np.clip(rgb_subset, 0.0, 255.0) / 255.0
+        lab = color.rgb2lab(rgb_normalized.reshape(-1, 1, 3)).reshape(-1, 3)
+
+        kmeans = KMeans(n_clusters=colors_to_extract, random_state=42, n_init=10)
+        kmeans.fit(lab)
+
+        centers_lab = kmeans.cluster_centers_
+        centers_rgb = color.lab2rgb(centers_lab.reshape(-1, 1, 3)).reshape(-1, 3)
+        centers_rgb_float = np.clip(centers_rgb * 255.0, 0.0, 255.0).astype(np.float32)
+
+        return self._build_palette_from_centers(img, centers_rgb_float, has_transparency=has_transparency)
+
+    def _generate_palette_perceptual(self, img, num_colors, has_transparency=True):
+        img_small = self._resize_for_palette(img)
+        rgb = self._extract_opaque_rgb(img_small)
+
+        if len(rgb) == 0:
+            return self._empty_palette(img)
+
+        unique_rgb, counts = self._compute_weighted_unique_colors(rgb)
+        colors_to_extract = num_colors - 1 if has_transparency else num_colors
+        colors_to_extract = max(1, min(colors_to_extract, len(unique_rgb)))
+
+        rgb_normalized = np.clip(unique_rgb, 0.0, 255.0) / 255.0
+        lab_points = color.rgb2lab(rgb_normalized.reshape(-1, 1, 3)).reshape(-1, 3).astype(np.float32)
+        seed = self._compute_palette_seed(unique_rgb)
+        centers_lab = self._weighted_kmeans(
+            lab_points,
+            counts,
+            colors_to_extract,
+            seed,
+            max_iterations=50,
+            convergence_threshold=0.01,
+        )
+
+        centers_rgb = color.lab2rgb(centers_lab.reshape(-1, 1, 3)).reshape(-1, 3)
+        centers_rgb_float = np.clip(np.round(centers_rgb * 255.0), 0.0, 255.0).astype(np.float32)
+        return self._build_palette_from_centers(img, centers_rgb_float, has_transparency=has_transparency)
+
+    def _generate_palette_kmeans_rgb(self, img, num_colors, has_transparency=True):
+        img_small = self._resize_for_palette(img)
+        rgb = self._extract_opaque_rgb(img_small)
+
+        if len(rgb) == 0:
+            return self._empty_palette(img)
+
+        unique_rgb, counts = self._compute_weighted_unique_colors(rgb)
+        colors_to_extract = num_colors - 1 if has_transparency else num_colors
+        colors_to_extract = max(1, min(colors_to_extract, len(unique_rgb)))
+
+        seed = self._compute_palette_seed(unique_rgb)
+        centers_rgb_float = self._weighted_kmeans(
+            unique_rgb,
+            counts,
+            colors_to_extract,
+            seed,
+            max_iterations=50,
+            convergence_threshold=0.1,
+        )
+        centers_rgb_float = np.clip(np.round(centers_rgb_float), 0.0, 255.0).astype(np.float32)
+        return self._build_palette_from_centers(img, centers_rgb_float, has_transparency=has_transparency)
+
+    def _generate_palette_selective(self, img, num_colors, has_transparency=True):
+        img_small = self._resize_for_palette(img)
+        rgb_image = img_small[:, :, :3].astype(np.float32)
+        rgb_flat = rgb_image.reshape(-1, 3)
+        edge_strengths = self._compute_edge_strengths(rgb_image).reshape(-1)
+
+        if img_small.shape[2] == 4:
+            alpha_flat = img_small[:, :, 3].reshape(-1)
+            opaque_mask = alpha_flat > 0
+            rgb_flat = rgb_flat[opaque_mask]
+            edge_strengths = edge_strengths[opaque_mask]
+
+        if len(rgb_flat) == 0:
+            return self._empty_palette(img)
+
+        saturations = self._compute_saturation(rgb_flat)
+        weights = 1.0 + 0.5 * saturations + 0.5 * edge_strengths.astype(np.float32)
+
+        colors_to_extract = num_colors - 1 if has_transparency else num_colors
+        colors_to_extract = max(1, min(colors_to_extract, len(rgb_flat)))
+
+        boxes = [
+            self._make_selective_box(
+                np.arange(len(rgb_flat), dtype=np.int32),
+                rgb_flat,
+                weights,
+                saturations,
+            )
+        ]
+
+        while len(boxes) < colors_to_extract:
+            best_box_idx = -1
+            best_score = -1.0
+
+            for idx, box in enumerate(boxes):
+                if len(box["indices"]) <= 1 or box["largest_range"] <= 0.0:
+                    continue
+                score = box["largest_range"] * box["total_weight"] * (0.5 + 0.5 * box["avg_saturation"])
+                if score > best_score:
+                    best_score = score
+                    best_box_idx = idx
+
+            if best_box_idx < 0:
+                break
+
+            box_to_split = boxes[best_box_idx]
+            channel = box_to_split["largest_channel"]
+            sorted_order = np.argsort(rgb_flat[box_to_split["indices"], channel], kind="mergesort")
+            sorted_indices = box_to_split["indices"][sorted_order]
+
+            cumulative_weights = np.cumsum(weights[sorted_indices])
+            split_pos = int(np.searchsorted(cumulative_weights, box_to_split["total_weight"] / 2.0, side="left"))
+            if split_pos <= 0:
+                split_pos = 1
+            if split_pos >= len(sorted_indices):
+                split_pos = len(sorted_indices) - 1
+
+            box1 = self._make_selective_box(sorted_indices[:split_pos], rgb_flat, weights, saturations)
+            box2 = self._make_selective_box(sorted_indices[split_pos:], rgb_flat, weights, saturations)
+
+            boxes[best_box_idx] = box1
+            boxes.append(box2)
+
+        centers_rgb_float = np.array([box["weighted_color"] for box in boxes], dtype=np.float32)
+        centers_rgb_float = np.clip(np.round(centers_rgb_float), 0.0, 255.0).astype(np.float32)
+        return self._build_palette_from_centers(img, centers_rgb_float, has_transparency=has_transparency)
 
     def extract_palette_from_reference(self, reference_img, num_colors=None, has_transparency=True):
         """Extract palette from a reference image."""
@@ -351,94 +686,18 @@ class SmartImagePaletteConvert:
 
         return unique_palette
 
-    def generate_palette(self, img, num_colors, has_transparency=True):
-        """Generate an optimal color palette using K-means clustering in CIELAB space."""
-        # Downsample large images for faster processing
-        h, w = img.shape[:2]
-        max_dim = 256
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            new_size = (int(w * scale), int(h * scale))
-            img_small = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
-        else:
-            img_small = img
+    def generate_palette(self, img, num_colors, algorithm=None, has_transparency=True):
+        """Generate a palette using the selected quantization algorithm."""
+        algorithm = algorithm or self.ALGORITHM_HYBRID
 
-        # Convert to CIELAB for better perceptual clustering
-        img_flat = img_small.reshape(-1, 4) if img_small.shape[2] == 4 else img_small.reshape(-1, 3)
+        if algorithm == self.ALGORITHM_PERCEPTUAL:
+            return self._generate_palette_perceptual(img, num_colors, has_transparency=has_transparency)
+        if algorithm == self.ALGORITHM_KMEANS_RGB:
+            return self._generate_palette_kmeans_rgb(img, num_colors, has_transparency=has_transparency)
+        if algorithm == self.ALGORITHM_SELECTIVE:
+            return self._generate_palette_selective(img, num_colors, has_transparency=has_transparency)
 
-        # Separate alpha channel if present
-        if img_small.shape[2] == 4:
-            rgb = img_flat[:, :3]
-            alpha = img_flat[:, 3]
-            # Only consider non-transparent pixels for color extraction
-            rgb = rgb[alpha > 0]
-        else:
-            rgb = img_flat
-
-        if len(rgb) == 0:
-            # Handle completely transparent images
-            if has_transparency:
-                if img.shape[2] == 4:
-                    return np.zeros((1, 4), dtype=np.uint8)
-                else:
-                    return np.zeros((1, 3), dtype=np.uint8)
-
-        # Use a subset of pixels for large images
-        max_pixels = 10000
-        if len(rgb) > max_pixels:
-            indices = np.random.choice(len(rgb), max_pixels, replace=False)
-            rgb_subset = rgb[indices]
-        else:
-            rgb_subset = rgb
-
-        # Convert RGB to CIELAB
-        rgb_normalized = rgb_subset / 255.0
-        lab = color.rgb2lab(rgb_normalized.reshape(-1, 1, 3)).reshape(-1, 3)
-
-        # Use KMeans to cluster colors
-        colors_to_extract = num_colors - 1 if has_transparency else num_colors
-        kmeans = KMeans(n_clusters=colors_to_extract, random_state=42, n_init=10)
-        kmeans.fit(lab)
-
-        # Convert centers back to RGB
-        centers_lab = kmeans.cluster_centers_
-        centers_rgb = color.lab2rgb(centers_lab.reshape(-1, 1, 3)).reshape(-1, 3)
-        centers_rgb = (centers_rgb * 255).astype(np.uint8)
-
-        # Use float32 for palette to accommodate potential negative values
-        centers_rgb_float = centers_rgb.astype(np.float32)
-
-        # Add transparency color if needed
-        if has_transparency:
-            # Use large negative RGB for transparent color temporarily, use float32
-            transparent_color = np.array([-99999.0, -99999.0, -99999.0, 0.0], dtype=np.float32)
-            if img.shape[2] == 4:
-                # Create palette with RGBA values using float32
-                palette = np.zeros((colors_to_extract + 1, 4), dtype=np.float32)
-                palette[:-1, :3] = centers_rgb_float
-                palette[:-1, 3] = 255.0  # Full opacity for color entries
-                palette[-1] = transparent_color  # Last entry is transparent (with modified RGB)
-            else:
-                # Create palette with RGB values using float32
-                palette = np.zeros((colors_to_extract + 1, 3), dtype=np.float32)
-                palette[:-1] = centers_rgb_float
-                palette[-1] = transparent_color[:3] # RGB part of modified transparent
-        else:
-            # No transparency needed
-            if img.shape[2] == 4:
-                # Use float32
-                palette = np.zeros((colors_to_extract, 4), dtype=np.float32)
-                palette[:, :3] = centers_rgb_float
-                palette[:, 3] = 255.0
-            else:
-                # Use float32
-                palette = centers_rgb_float
-
-        # Sorting works fine with floats
-        sorted_palette_float = self._sort_palette(palette)
-        # Return palette as uint8 after processing is complete in convert_image
-        # Keep it as float32 internally for dithering/mapping
-        return sorted_palette_float # Return float palette
+        return self._generate_palette_hybrid(img, num_colors, has_transparency=has_transparency)
 
     def apply_floyd_steinberg_dithering(self, img, palette, dithering_amount=1.0):
         """Apply Floyd-Steinberg dithering with variable amount and optimizations."""
@@ -541,7 +800,7 @@ class SmartImagePaletteConvert:
         # Palette is expected to be float32 here
         return self.apply_floyd_steinberg_dithering(image, palette, dithering_amount)
 
-    def convert_image(self, image, num_colors, dithering_amount, reference_image=None, additional_colors=None):
+    def convert_image(self, image, num_colors, dithering_amount, algorithm, reference_image=None, additional_colors=None):
         # Convert from tensor to numpy array
         input_image = 255. * image.cpu().numpy()
 
@@ -562,7 +821,7 @@ class SmartImagePaletteConvert:
         else:
             # Generate optimal palette from the input image using num_colors
             # Returns float32 palette with modified transparent color already
-            palette_float = self.generate_palette(input_image[0], num_colors)
+            palette_float = self.generate_palette(input_image[0], num_colors, algorithm=algorithm)
 
         # Process additional colors if provided
         if additional_colors is not None:
