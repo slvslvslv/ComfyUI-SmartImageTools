@@ -1068,6 +1068,7 @@ class SmartBackgroundRemove:
                 "tolerance": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "each_point_own_color": ("BOOLEAN", {"default": True}),
                 "debug_points": ("BOOLEAN", {"default": False}),
+                "clearEdges": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
             },
             "optional": {
                 "start_point": ("POINT",),
@@ -1140,7 +1141,7 @@ class SmartBackgroundRemove:
 
         return background_mask # Return the final uint8 background mask
 
-    def flood_remove(self, image, fill_size, tolerance, each_point_own_color, debug_points, start_point=None, start_points=None):
+    def flood_remove(self, image, fill_size, tolerance, each_point_own_color, debug_points, clearEdges=0, start_point=None, start_points=None):
         # Convert from tensor to numpy array
         input_image = 255. * image.cpu().numpy()
         batch_size = input_image.shape[0]
@@ -1228,6 +1229,14 @@ class SmartBackgroundRemove:
                 result[:, :, :3] = img
                 result[:, :, 3] = mask * 255
             
+            # Clear edge pixels to transparent
+            if clearEdges > 0:
+                ce = clearEdges
+                result[:ce, :, 3] = 0      # Top
+                result[-ce:, :, 3] = 0     # Bottom
+                result[:, :ce, 3] = 0      # Left
+                result[:, -ce:, 3] = 0     # Right
+
             # Draw debug points if requested
             if debug_points and points_to_use:
                 # Ensure result is uint8 for OpenCV drawing functions
@@ -2204,9 +2213,11 @@ class SmartSaveAnimatedPNG:
             else:
                 filename = filename + '.gif'
 
-        # Convert relative path to absolute path within ComfyUI's output directory
         output_dir = folder_paths.get_output_directory()
-        full_path = os.path.join(output_dir, filename)
+        if os.path.isabs(filename):
+            full_path = filename
+        else:
+            full_path = os.path.join(output_dir, filename)
         
         # Create directories if they don't exist
         directory = os.path.dirname(full_path)
@@ -2397,9 +2408,18 @@ class SmartSaveAnimatedPNG:
         return (full_path,)	
 
     def save_apng(self, images, fps, filename_prefix="ComfyUI", lossless=True, save_metadata=True, format="APNG", prompt=None, extra_pnginfo=None):
-        full_output_folder, filename, counter, subfolder, filename_prefix_ = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
-        # Extract the base filename part from the potentially path-like filename_prefix_
-        base_filename = os.path.basename(filename_prefix_)
+        abs_prefix = os.path.abspath(filename_prefix)
+        is_absolute = os.path.isabs(filename_prefix) or (len(filename_prefix) >= 2 and filename_prefix[1] == ':')
+        cross_drive = is_absolute and os.path.splitdrive(abs_prefix)[0].lower() != os.path.splitdrive(self.output_dir)[0].lower()
+
+        if cross_drive:
+            full_output_folder = os.path.dirname(abs_prefix)
+            base_filename = os.path.basename(abs_prefix)
+            subfolder = ""
+            os.makedirs(full_output_folder, exist_ok=True)
+        else:
+            full_output_folder, filename, counter, subfolder, filename_prefix_ = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+            base_filename = os.path.basename(filename_prefix_)
         # Use a single filename, not numbered sequence
         if format == "APNG":
             ext = "apng"
@@ -2414,7 +2434,10 @@ class SmartSaveAnimatedPNG:
         if format == "GIF":
             results = list()
             try:
-                relative_filename = os.path.join(subfolder, file) if subfolder else file
+                if cross_drive:
+                    relative_filename = file_path
+                else:
+                    relative_filename = os.path.join(subfolder, file) if subfolder else file
                 self.save_animated_gif(
                     images=images,
                     filename=relative_filename,
@@ -2726,11 +2749,11 @@ class SmartImagePaletteCreate:
         return {
             "required": {
                 "colors": ("INT", {"default": 5, "min": 1, "max": 5, "step": 1}),
-                "color_1": ("COLOR", {"default": "#000000"}),  # Black
-                "color_2": ("COLOR", {"default": "#000000"}),  # Black
-                "color_3": ("COLOR", {"default": "#000000"}),  # Black
-                "color_4": ("COLOR", {"default": "#000000"}),  # Black
-                "color_5": ("COLOR", {"default": "#000000"}),  # Black
+                "color_1": ("SMART_COLOR", {"default": "#000000"}),
+                "color_2": ("SMART_COLOR", {"default": "#000000"}),
+                "color_3": ("SMART_COLOR", {"default": "#000000"}),
+                "color_4": ("SMART_COLOR", {"default": "#000000"}),
+                "color_5": ("SMART_COLOR", {"default": "#000000"}),
             }
         }
 
