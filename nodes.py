@@ -3812,7 +3812,168 @@ class SmartColorFillMask:
         return (output_tensor,)
 
 
+class SmartLoadVideo:
+    """Load video frames using FFmpeg with correct color space handling.
+
+    OpenCV-based loaders (like VHS Load Video Path) apply BT.601 YUV-to-RGB
+    conversion regardless of the video's actual color matrix metadata.  For HD/4K
+    content encoded with BT.709 this produces a visible red shift and over-saturation.
+
+    This node shells out to FFmpeg which reads the container/stream color metadata
+    and applies the correct conversion matrix automatically.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("STRING", {"placeholder": "X://insert/path/here.mp4"}),
+                "force_rate": ("FLOAT", {"default": 0, "min": 0, "max": 60, "step": 0.01}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": 999999, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "FLOAT")
+    RETURN_NAMES = ("images", "frame_count", "fps")
+    FUNCTION = "load_video"
+    CATEGORY = "Smart Image Tools"
+
+    @staticmethod
+    def _find_ffmpeg():
+        path = os.environ.get("VHS_FORCE_FFMPEG_PATH")
+        if path:
+            return path
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+            return get_ffmpeg_exe()
+        except Exception:
+            pass
+        import shutil
+        path = shutil.which("ffmpeg")
+        if path:
+            return path
+        for name in ("ffmpeg", "ffmpeg.exe"):
+            if os.path.isfile(name):
+                return os.path.abspath(name)
+        raise FileNotFoundError(
+            "ffmpeg is required by SmartLoadVideo and could not be found. "
+            "Install imageio-ffmpeg, place ffmpeg in the ComfyUI root, "
+            "or add it to your system PATH."
+        )
+
+    @staticmethod
+    def _probe_video(ffmpeg, video_path):
+        import subprocess, re
+        args = [ffmpeg, "-i", video_path, "-f", "null", "-frames:v", "0", "-"]
+        res = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        info = res.stderr.decode("utf-8", errors="replace")
+
+        width = height = 0
+        fps = 24.0
+        duration = 0.0
+        color_space = None
+        color_range = None
+
+        for line in info.split("\n"):
+            m = re.search(r"Stream .* Video.*, (\d+)x(\d+)", line)
+            if m:
+                width, height = int(m.group(1)), int(m.group(2))
+                fm = re.search(r"([\d.]+)\s*fps", line)
+                if fm:
+                    fps = float(fm.group(1))
+                # Parse color info from pix_fmt annotation, e.g. yuv420p(tv, bt709)
+                cm = re.search(r"\((tv|pc)(?:,\s*(\w+))?\)", line)
+                if cm:
+                    color_range = cm.group(1)
+                    if cm.group(2):
+                        color_space = cm.group(2)
+                break
+
+        dm = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", info)
+        if dm:
+            duration = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3))
+
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Could not parse video dimensions from: {video_path}")
+
+        if color_range is None:
+            color_range = "tv"
+        if color_space is None:
+            color_space = "bt709" if min(width, height) >= 720 else "smpte170m"
+
+        return width, height, fps, duration, color_space, color_range
+
+    def load_video(self, video, force_rate, frame_load_cap, skip_first_frames, select_every_nth):
+        import subprocess
+
+        ffmpeg = self._find_ffmpeg()
+        width, height, source_fps, duration, color_space, color_range = self._probe_video(ffmpeg, video)
+
+        effective_fps = force_rate if force_rate > 0 else source_fps
+
+        vfilters = []
+        if force_rate > 0:
+            vfilters.append(f"fps=fps={force_rate}")
+
+        # Explicit color conversion: use detected (or default) input color matrix
+        # and range, always output full-range RGB.  accurate_rnd and full_chroma_int
+        # improve the swscale YUV→RGB quality for sub-sampled chroma (yuv420p etc.).
+        vfilters.append(
+            f"scale=in_color_matrix={color_space}"
+            f":in_range={color_range}:out_range=pc"
+            f":flags=accurate_rnd+full_chroma_int"
+        )
+
+        args = [ffmpeg, "-v", "error", "-an", "-i", video]
+        args += ["-vf", ",".join(vfilters)]
+        args += ["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+
+        bpp = width * height * 3
+        frames = []
+        frame_idx = 0
+        frames_added = 0
+
+        with subprocess.Popen(args, stdout=subprocess.PIPE) as proc:
+            buf = bytearray()
+            while True:
+                chunk = proc.stdout.read(bpp - len(buf))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) < bpp:
+                    continue
+
+                raw = bytes(buf)
+                buf.clear()
+
+                frame_idx += 1
+                if frame_idx <= skip_first_frames:
+                    continue
+                if (frame_idx - skip_first_frames - 1) % select_every_nth != 0:
+                    continue
+
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+                frames.append(frame)
+                frames_added += 1
+
+                if frame_load_cap > 0 and frames_added >= frame_load_cap:
+                    proc.terminate()
+                    break
+
+        if not frames:
+            raise RuntimeError(f"No frames decoded from: {video}")
+
+        images = np.stack(frames).astype(np.float32) / 255.0
+        images = torch.from_numpy(images)
+
+        output_fps = effective_fps / select_every_nth
+        return (images, len(images), output_fps)
+
+
 NODE_CLASS_MAPPINGS = {
+    "SmartLoadVideo": SmartLoadVideo,
     "SmartImagePaletteConvert": SmartImagePaletteConvert,
     "SmartImagesProcessor": SmartImagesProcessor,
     "SmartGenerateImage": SmartGenerateImage,
@@ -3845,6 +4006,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SmartLoadVideo": "Smart Load Video",
     "SmartImagePaletteConvert": "Smart Image Palette Convert",
     "SmartImagesProcessor": "Smart Images Processor",
     "SmartGenerateImage": "Smart Generate Image",

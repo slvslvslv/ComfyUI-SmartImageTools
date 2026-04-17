@@ -108,6 +108,41 @@ function createColorWidget(name, value) {
     return widget;
 }
 
+function hideWidget(node, widget) {
+    if (widget._hidden) return;
+    widget._hidden = true;
+    widget._origType = widget.type;
+    widget._origComputeSize = widget.computeSize;
+    widget.type = "hidden";
+    widget.computeSize = () => [0, -4];
+}
+
+function showWidget(node, widget) {
+    if (!widget._hidden) return;
+    widget._hidden = false;
+    widget.type = widget._origType;
+    widget.computeSize = widget._origComputeSize;
+}
+
+function updateColorVisibility(node) {
+    const colorsWidget = node.widgets?.find(w => w.name === "colors");
+    if (!colorsWidget) return;
+
+    const count = colorsWidget.value;
+    for (let i = 1; i <= 5; i++) {
+        const cw = node.widgets.find(w => w.name === `color_${i}`);
+        if (!cw) continue;
+        if (i <= count) {
+            showWidget(node, cw);
+        } else {
+            hideWidget(node, cw);
+        }
+    }
+
+    node.setSize(node.computeSize());
+    app.canvas.setDirty(true);
+}
+
 app.registerExtension({
     name: "Comfy.SmartNodes.SmartColorWidget",
     getCustomWidgets() {
@@ -119,6 +154,31 @@ app.registerExtension({
                 minWidth: 150,
                 minHeight: 32,
             }),
+        };
+    },
+    beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "SmartImagePaletteCreate") return;
+
+        const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            origOnNodeCreated?.apply(this, arguments);
+
+            const colorsWidget = this.widgets?.find(w => w.name === "colors");
+            if (colorsWidget) {
+                const origCallback = colorsWidget.callback;
+                colorsWidget.callback = (value) => {
+                    origCallback?.call(colorsWidget, value);
+                    updateColorVisibility(this);
+                };
+            }
+
+            requestAnimationFrame(() => updateColorVisibility(this));
+        };
+
+        const origOnConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (data) {
+            origOnConfigure?.apply(this, arguments);
+            requestAnimationFrame(() => updateColorVisibility(this));
         };
     },
 });
