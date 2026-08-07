@@ -2632,21 +2632,31 @@ class SmartDrawPoints:
 class SmartLoadGIFImage:
     @classmethod
     def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
-        files = folder_paths.filter_files_content_types(files, ["image", "animated"])
-        return {"required":
-                    {"image": (sorted(files), {"image_upload": True}),
-                     "custom_frame": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1})},
-                }
+        return {
+            "required": {
+                # STRING path (absolute or Comfy input-relative) so API clients
+                # like SmartComfyBridge can pass task-folder GIFs. The old combo
+                # dropdown only listed files already inside input/ and rejected
+                # absolute paths at prompt validation.
+                "image": ("STRING", {"default": "", "multiline": False,
+                                     "placeholder": "X://path/to/file.gif"}),
+                "custom_frame": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
+            },
+        }
 
     CATEGORY = "SmartImageTools"
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "MASK", "IMAGE", "MASK", "IMAGE", "MASK")
     RETURN_NAMES = ("all_images", "all_masks", "first_frame", "first_mask", "last_frame", "last_mask", "custom_frame", "custom_mask")
     FUNCTION = "load_gif_image"
 
+    @staticmethod
+    def _resolve_image_path(image: str) -> str:
+        if isinstance(image, str) and image and os.path.isfile(image):
+            return image
+        return folder_paths.get_annotated_filepath(image)
+
     def load_gif_image(self, image, custom_frame):
-        image_path = folder_paths.get_annotated_filepath(image)
+        image_path = self._resolve_image_path(image)
 
         img = node_helpers.pillow(Image.open, image_path)
 
@@ -2728,7 +2738,7 @@ class SmartLoadGIFImage:
 
     @classmethod
     def IS_CHANGED(s, image, custom_frame):
-        image_path = folder_paths.get_annotated_filepath(image)
+        image_path = SmartLoadGIFImage._resolve_image_path(image)
         m = hashlib.sha256()
         with open(image_path, 'rb') as f:
             m.update(f.read())
@@ -2737,10 +2747,13 @@ class SmartLoadGIFImage:
 
     @classmethod
     def VALIDATE_INPUTS(s, image, custom_frame):
-        if not folder_paths.exists_annotated_filepath(image):
-            return "Invalid image file: {}".format(image)
-
-        return True
+        if not image:
+            return "Image path is required"
+        if os.path.isfile(image):
+            return True
+        if folder_paths.exists_annotated_filepath(image):
+            return True
+        return "Invalid image file: {}".format(image)
 
 
 class SmartImagePaletteCreate:
@@ -3907,6 +3920,9 @@ class SmartLoadVideo:
 
     def load_video(self, video, force_rate, frame_load_cap, skip_first_frames, select_every_nth):
         import subprocess
+
+        if not video or not os.path.isfile(video):
+            raise FileNotFoundError(f"Video file not found: {video!r}")
 
         ffmpeg = self._find_ffmpeg()
         width, height, source_fps, duration, color_space, color_range = self._probe_video(ffmpeg, video)
